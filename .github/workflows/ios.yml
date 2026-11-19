@@ -48,6 +48,17 @@ jobs:
           cd ..
           shasum -a 256 TingFlow-unsigned.ipa > SHA256.txt
           printf 'Unsigned IPA; UI test result is recorded separately. Self-signing required.\n' > BUILD_STATUS.txt
+      - name: Upload unsigned IPA after successful Release build
+        if: steps.package.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: TingFlow-unsigned-${{ github.run_number }}
+          path: |
+            build/TingFlow-unsigned.ipa
+            build/SHA256.txt
+            build/BUILD_STATUS.txt
+          if-no-files-found: error
+          retention-days: 14
       - name: Native iOS simulator UI tests
         id: ui-tests
         timeout-minutes: 20
@@ -58,18 +69,3 @@ jobs:
             -sdk iphonesimulator -destination "platform=iOS Simulator,id=$DEVICE_ID" \
             -derivedDataPath build/simulator -resultBundlePath build/NativeUI.xcresult \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO test
-      - name: Record UI test status in IPA metadata
-        if: always() && steps.package.outcome == 'success'
-        run: |
-          echo "UI test conclusion: ${{ steps.ui-tests.conclusion }}" >> build/BUILD_STATUS.txt
-      - name: Upload unsigned IPA after successful Release build
-        if: always() && steps.package.outcome == 'success'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: TingFlow-unsigned-${{ github.run_number }}
-          path: |
-            build/TingFlow-unsigned.ipa
-            build/SHA256.txt
-            build/BUILD_STATUS.txt
-          if-no-files-found: error
-          retention-days: 14
