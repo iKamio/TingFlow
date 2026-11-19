@@ -1,0 +1,116 @@
+import Foundation
+
+private final class HTTPSOnlyDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(request.url?.scheme?.lowercased() == "https" ? request : nil)
+    }
+}
+
+final class CatalogClient {
+    private let session: URLSession
+    init() {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpShouldSetCookies = false
+        configuration.httpCookieStorage = nil
+        configuration.urlCredentialStorage = nil
+        configuration.timeoutIntervalForRequest = 20
+        configuration.timeoutIntervalForResource = 30
+        session = URLSession(configuration: configuration, delegate: HTTPSOnlyDelegate(), delegateQueue: nil)
+    }
+
+    // These are platform web endpoints, not an official supported SDK.
+    // Keep adapters independent: availability may change without notice.
+    func search(_ query: String, platform: MusicPlatform, page: Int = 1) async throws -> [Song] {
+        let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return [] }
+        let url: URL
+        var referer: String
+        switch platform {
+        case .netease:
+            url = try makeURL("https://music.163.com/api/search/get", [
+                "s": query, "type": "1", "limit": "30", "offset": String(max(0, page - 1) * 30)
+            ])
+            referer = "https://music.163.com/"
+        case .kugou:
+            url = try makeURL("https://songsearch.kugou.com/song_search_v2", [
+                "keyword": query, "page": String(max(1, page)), "pagesize": "30",
+                "userid": "-1", "platform": "WebFilter", "filter": "2"
+            ])
+            referer = "https://www.kugou.com/"
+        case .local, .emby, .subsonic:
+            return []
+        }
+        var request = URLRequest(url: url)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(referer, forHTTPHeaderField: "Referer")
+        request.setValue("Mozilla/5.0 TingFlow/0.1", forHTTPHeaderField: "User-Agent")
+        let (data, response) = try await session.data(for: request)
+        try Task.checkCancellation()
+        guard let http = response as? HTTPURLResponse else { throw MusicError.invalidResponse }
+        guard (200..<300).contains(http.statusCode) else { throw MusicError.http(http.statusCode) }
+        guard data.count < 4_000_000,
+              let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw MusicError.invalidResponse
+        }
+        switch platform {
+        case .netease:
+            guard (root["code"] as? Int) == 200,
+                  let result = root["result"] as? [String: Any] else { throw MusicError.invalidResponse }
+            return (result["songs"] as? [[String: Any]] ?? []).compactMap(parseNetease)
+        case .kugou:
+            guard (root["status"] as? Int) == 1,
+                  let result = root["data"] as? [String: Any] else { throw MusicError.invalidResponse }
+            return (result["lists"] as? [[String: Any]] ?? []).compactMap(parseKugou)
+        case .local, .emby, .subsonic:
+            return []
+        }
+    }
+
+    private func makeURL(_ path: String, _ parameters: [String: String]) throws -> URL {
+        guard var components = URLComponents(string: path) else { throw MusicError.invalidURL }
+        components.queryItems = parameters.sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) }
+        guard let url = components.url else { throw MusicError.invalidURL }
+        return url
+    }
+    private func string(_ value: Any?) -> String? {
+        if let value = value as? String { return value.isEmpty ? nil : value }
+        if let value = value as? NSNumber { return value.stringValue }
+        return nil
+    }
+    private func clean(_ input: String) -> String {
+        input.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    private func secureArtwork(_ value: String?) -> URL? {
+        guard let value = value,
+              var components = URLComponents(string: value.replacingOccurrences(of: "{size}", with: "480")) else { return nil }
+        if components.scheme == "http" { components.scheme = "https" }
+        guard components.scheme == "https" else { return nil }
+        return components.url
+    }
+    private func parseNetease(_ item: [String: Any]) -> Song? {
+        guard let id = string(item["id"]), let name = item["name"] as? String else { return nil }
+        let album = item["album"] as? [String: Any] ?? [:]
+        let artists = item["artists"] as? [[String: Any]] ?? []
+        return Song(platform: .netease, platformID: id, title: clean(name),
+                    artist: artists.compactMap { $0["name"] as? String }.joined(separator: " / "),
+                    album: album["name"] as? String ?? "", duration: (item["duration"] as? Double ?? 0) / 1000,
+                    artworkURL: secureArtwork(album["picUrl"] as? String), albumID: string(album["id"]))
+    }
+    private func parseKugou(_ item: [String: Any]) -> Song? {
+        guard let hash = string(item["FileHash"]),
+              let name = item["SongName"] as? String ?? item["OriSongName"] as? String else { return nil }
+        return Song(platform: .kugou, platformID: string(item["MixSongID"]) ?? hash,
+                    title: clean(name), artist: clean(item["SingerName"] as? String ?? ""),
+                    album: item["AlbumName"] as? String ?? "", duration: item["Duration"] as? Double ?? 0,
+                    artworkURL: secureArtwork(item["Image"] as? String), albumID: string(item["AlbumID"]),
+                    hash: hash, highQualityHash: string(item["HQFileHash"]), losslessHash: string(item["SQFileHash"]))
+    }
+}

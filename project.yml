@@ -1,0 +1,77 @@
+name: TingFlow
+options:
+  bundleIdPrefix: com.ikamio
+  deploymentTarget:
+    iOS: '16.0'
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: '5.0'
+    TARGETED_DEVICE_FAMILY: '1,2'
+    CODE_SIGNING_ALLOWED: NO
+    MARKETING_VERSION: '0.5.1'
+    CURRENT_PROJECT_VERSION: '1'
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+targets:
+  TingFlow:
+    type: application
+    platform: iOS
+    sources:
+      - path: app/TingFlow
+        excludes:
+          - Info.plist
+          - '**/*.md'
+    info:
+      path: app/TingFlow/Info.plist
+      properties:
+        CFBundleDisplayName: 听流
+        CFBundleName: TingFlow
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UIBackgroundModes:
+          - audio
+        NSLocalNetworkUsageDescription: 连接你添加的局域网 Emby 音乐服务器。
+        NSPhotoLibraryAddUsageDescription: 仅在你点击保存时，将短期登录二维码添加到相册，用于同机网易云扫码。
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ikamio.tingflow
+        PRODUCT_NAME: TingFlow
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        GENERATE_INFOPLIST_FILE: NO
+      configs:
+        Debug:
+          INFOPLIST_FILE: tests/SourcePicker-Debug-Info.plist
+  TingFlowUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: ui-tests
+    dependencies:
+      - target: TingFlow
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ikamio.tingflow.uitests
+        TEST_TARGET_NAME: TingFlow
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  TingFlow:
+    build:
+      targets:
+        TingFlow: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - TingFlowUITests
+    archive:
+      config: Release

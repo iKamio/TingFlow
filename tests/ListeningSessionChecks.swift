@@ -1,0 +1,53 @@
+import Foundation
+
+@main struct ListeningSessionChecks {
+    static func main() {
+        var checks = 0
+        func check(_ condition: Bool, _ name: String) { precondition(condition, name); checks += 1 }
+        let song = Song(platform: .netease, platformID: "101", title: "Fixture", artist: "Artist", album: "", duration: 120, accountScope: "netease:7")
+        var value = ListeningSession(song: song, scope: "netease:7")
+        check(value.belongs(to: "netease:7") && !value.belongs(to: "netease:8"), "account-scoped session")
+        check(!value.sample(position: 0, monotonic: 100, isPlaying: false), "not requested playback")
+        check(!value.sample(position: 0, monotonic: 101, isPlaying: true), "baseline is not a start")
+        check(value.sample(position: 0.5, monotonic: 101.5, isPlaying: true), "first actual progress starts once")
+        check(!value.sample(position: 1, monotonic: 102, isPlaying: true), "progress does not duplicate start")
+        check(value.listenedSeconds == 1, "one real second")
+        _ = value.sample(position: 1, monotonic: 103, isPlaying: true)
+        check(value.listenedSeconds == 1, "stall is not listening")
+        _ = value.sample(position: 1, monotonic: 104, isPlaying: false)
+        _ = value.sample(position: 1, monotonic: 200, isPlaying: true)
+        check(value.listenedSeconds == 1, "long pause has no credit")
+        _ = value.sample(position: 1.5, monotonic: 200.5, isPlaying: true)
+        check(value.listenedSeconds == 1.5, "resume credits only actual progress")
+        value.seek()
+        _ = value.sample(position: 90, monotonic: 201, isPlaying: true)
+        check(value.listenedSeconds == 1.5, "seek baseline excludes skipped content")
+        _ = value.sample(position: 91, monotonic: 202, isPlaying: true)
+        check(value.listenedSeconds == 2.5, "post-seek audible progress")
+        _ = value.sample(position: 100, monotonic: 202.1, isPlaying: true)
+        check(value.listenedSeconds == 2.5, "unannounced seek jump excluded")
+        _ = value.sample(position: 119, monotonic: 230, isPlaying: true)
+        check(value.listenedSeconds == 2.5, "suspended callbacks never count the full gap")
+        _ = value.sample(position: .nan, monotonic: 231, isPlaying: true)
+        _ = value.sample(position: 119, monotonic: 232, isPlaying: true)
+        check(value.listenedSeconds == 2.5, "invalid sample clears baseline")
+        let snapshot = value.finish()
+        check(snapshot?.seconds == 2 && snapshot?.song.id == song.id, "floor actual seconds, never full duration")
+        check(value.finish() == nil, "finish exactly once")
+        check(!value.sample(position: 120, monotonic: 233, isPlaying: true), "closed session cannot accrue")
+        var short = ListeningSession(song: song, scope: "netease:7")
+        _ = short.sample(position: 0, monotonic: 0, isPlaying: true)
+        _ = short.sample(position: 0.2, monotonic: 0.2, isPlaying: true)
+        check(short.finish() == nil && short.finish() == nil, "no fabricated one-second minimum")
+        var capped = ListeningSession(song: song, scope: "netease:7", duration: 2)
+        _ = capped.sample(position: 0, monotonic: 0, isPlaying: true)
+        for i in 1...5 { _ = capped.sample(position: Double(i), monotonic: Double(i), isPlaying: true) }
+        check(capped.finish()?.seconds == 2, "known duration bounds a session")
+        var invalid = ListeningSession(song: song, scope: "netease:7", duration: -.infinity)
+        _ = invalid.sample(position: 0, monotonic: 0, isPlaying: true)
+        check(!invalid.sample(position: 1, monotonic: 1, isPlaying: true) && invalid.finish() == nil, "invalid supplied duration fails closed")
+        var empty = ListeningSession(song: song, scope: "netease:7")
+        check(empty.finish() == nil, "resolved-but-unplayed sessions do not report")
+        print("PASS: \(checks) listening-session progress, pause, seek, duration and duplicate-finish checks")
+    }
+}
