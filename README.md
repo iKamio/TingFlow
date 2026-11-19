@@ -15,7 +15,7 @@ iOS 16+ 原生 SwiftUI 音乐播放器，iOS 26 使用系统 TabView、搜索 Ta
 - 标准 GitHub-hosted `macos-26` 运行器，Xcode 26；不使用付费大型运行器。
 - 权限默认 `contents: read`，Checkout 不持久化凭据，不需要添加专用 PAT 或签名证书。
 - 先运行合成协议/状态机检查，构建 Release，再做 iOS 模拟器 UI 验证。
-- **只有完整测试成功后才上传 unsigned IPA**。UI 截图均为明确标记的合成数据。
+- 只有完整测试成功后才上传 unsigned IPA。公开工作流不上传 UI 截图、录屏、UI 层级文本或 Xcode result bundle；GitHub Actions 仍会公开普通构建/测试日志。
 - IPA 无签名、无 provisioning profile，须自行签名；App 不会静默安装。
 - 公开仓库的构建日志和上传产物可被他人查看。标准运行器是否能够启动仍取决于 GitHub 当时的账户和服务状态。
 

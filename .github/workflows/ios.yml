@@ -66,17 +66,3 @@ jobs:
             build/BUILD_STATUS.txt
           if-no-files-found: error
           retention-days: 14
-      - name: Export synthetic UI evidence
-        if: always()
-        run: |
-          if [ -d build/NativeUI.xcresult ]; then
-            xcrun xcresulttool export attachments --path build/NativeUI.xcresult --output-path build/ui-screenshots
-          fi
-      - name: Upload UI evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: TingFlow-native-ui-${{ github.run_number }}
-          path: build/ui-screenshots
-          if-no-files-found: warn
-          retention-days: 7
