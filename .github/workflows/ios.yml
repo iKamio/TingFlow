@@ -38,6 +38,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' build \
             | tee "$RUNNER_TEMP/TingFlow-build.log"
       - name: Package unsigned IPA
+        id: package
         run: |
           set -euo pipefail
           mkdir -p build/package/Payload
@@ -46,8 +47,9 @@ jobs:
           /usr/bin/zip -q -r ../TingFlow-unsigned.ipa Payload
           cd ..
           shasum -a 256 TingFlow-unsigned.ipa > SHA256.txt
-          printf 'Unsigned development build. Synthetic UI fixtures only. Self-signing required.\n' > BUILD_STATUS.txt
+          printf 'Unsigned IPA; UI test result is recorded separately. Self-signing required.\n' > BUILD_STATUS.txt
       - name: Native iOS simulator UI tests
+        id: ui-tests
         timeout-minutes: 20
         run: |
           set -euo pipefail
@@ -56,7 +58,11 @@ jobs:
             -sdk iphonesimulator -destination "platform=iOS Simulator,id=$DEVICE_ID" \
             -derivedDataPath build/simulator -resultBundlePath build/NativeUI.xcresult \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO test
-      - name: Upload IPA only after all checks pass
+      - name: Record UI test status in IPA metadata
+        if: always() && steps.package.outcome == 'success'
+        run: echo "UI test conclusion: ${{ steps.ui-tests.conclusion }}" >> build/BUILD_STATUS.txt
+      - name: Upload unsigned IPA after successful Release build
+        if: always() && steps.package.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: TingFlow-unsigned-${{ github.run_number }}
