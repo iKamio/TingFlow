@@ -91,6 +91,12 @@ function makeVector() {
     data: { encryptedData: encryptedKeyDocument.toString('base64'), timestamp: FIXED.timestamp,
       signature: sign(FIXED.timestamp, FIXED.nonce).toString('base64') }
   };
+  // A full AES block ending in 0x11 cannot be valid PKCS#7 padding.
+  // Encrypt without padding so this fixture tests a real decode failure,
+  // not an arbitrary byte sequence that a platform JSON parser may classify.
+  const invalidPadCipher = crypto.createCipheriv('aes-128-ecb', EAPI, null);
+  invalidPadCipher.setAutoPadding(false);
+  const invalidPadding = Buffer.concat([invalidPadCipher.update(Buffer.alloc(16, 0x11)), invalidPadCipher.final()]);
   const responseBytes = Buffer.from(JSON.stringify(FIXED.response));
   const compressed = portableGzip(Buffer.from(JSON.stringify(FIXED.gzipResponse)), { level: 9, mtime: 0 });
   const overLimitPlain = Buffer.from(JSON.stringify({ code: 200, data: { value: 'A'.repeat(2 * 1024 * 1024 + 1) } }));
@@ -99,6 +105,7 @@ function makeVector() {
     provenance: 'synthetic; independently generated with Node built-in crypto/zlib; no service access',
     inputs: FIXED, expected: { peerPublic: peerPub.toString('base64'), requestPlaintext: requestPlaintext(FIXED.payload).toString(),
       C, S, R, registration, signedKeyResponse,
+      invalidPaddingResponse: invalidPadding.toString('base64'),
       encryptedResponse: aes(EAPI, responseBytes).toString('base64'),
       encryptedGzipResponse: aes(EAPI, compressed).toString('base64'),
       encryptedOversizeGzipResponse: aes(EAPI, overLimitGzip).toString('base64'),
@@ -118,6 +125,7 @@ function run() {
   assert.deepEqual(actual, expected, 'independent Node vector must match frozen fixture');
   assert.equal(aes(STATIC, Buffer.from(expected.expected.signedKeyResponse.data.encryptedData, 'base64'), true).toString(),
     JSON.stringify({ publicKey: expected.expected.peerPublic, version: FIXED.version, sk: FIXED.sk }));
+  assert.throws(() => aes(EAPI, Buffer.from(expected.expected.invalidPaddingResponse, 'base64'), true), 'explicit invalid PKCS#7 padding');
   assert.deepEqual(JSON.parse(aes(EAPI, Buffer.from(expected.expected.encryptedResponse, 'base64'), true)), FIXED.response);
   assert.deepEqual(JSON.parse(zlib.gunzipSync(aes(EAPI, Buffer.from(expected.expected.encryptedGzipResponse, 'base64'), true))), FIXED.gzipResponse);
   const oversized = zlib.gunzipSync(aes(EAPI, Buffer.from(expected.expected.encryptedOversizeGzipResponse, 'base64'), true));

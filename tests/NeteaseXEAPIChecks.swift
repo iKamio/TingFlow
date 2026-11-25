@@ -17,7 +17,7 @@ import Foundation
         }
         func rejects(_ error: NeteaseXEAPI.Failure, _ name: String, _ body: () throws -> Void) {
             do { try body(); preconditionFailure("FAIL: \(name)") }
-            catch let actual as NeteaseXEAPI.Failure { expect(actual == error, name) }
+            catch let actual as NeteaseXEAPI.Failure { expect(actual == error, name + " (expected \(error), got \(actual))") }
             catch { preconditionFailure("FAIL: \(name): non-sanitized error type") }
         }
         func json(_ value: Any) throws -> Data { try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes]) }
@@ -90,8 +90,11 @@ import Foundation
                "decrypt and bounded-gunzip encrypted response")
         let business = try NeteaseXEAPI.response(Data("{\"code\":400}".utf8))
         expect((business["code"] as? Int) == 400, "preserve plain JSON business errors")
-        rejects(.cryptography, "no plaintext fallback after corrupt ciphertext") {
-            _ = try NeteaseXEAPI.response(Data(repeating: 0, count: 16))
+        rejects(.cryptography, "reject explicitly invalid PKCS7 padding without plaintext fallback") {
+            _ = try NeteaseXEAPI.response(decode(expected["invalidPaddingResponse"] as! String))
+        }
+        rejects(.invalidResponse, "reject non-block-sized ciphertext") {
+            _ = try NeteaseXEAPI.response(Data(repeating: 0xff, count: 15))
         }
         rejects(.invalidInput, "reject invalid signed-response nonce") {
             _ = try NeteaseXEAPI.publicKey(from: signed, nonce: "short")
