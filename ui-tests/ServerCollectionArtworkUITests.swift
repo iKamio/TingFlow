@@ -126,10 +126,15 @@ final class ServerCollectionArtworkUITests: XCTestCase {
         XCTAssertEqual(app.buttons[diagnosticID(0) + ".copy"].value as? String, "尚未复制")
         let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: reopened)
         XCTAssertEqual(XCTWaiter.wait(for: [dismissed], timeout: 20), .completed)
-        value("封面暂未载入", element: header)
+        // Re-query after native sheet dismissal instead of retaining the
+        // pre-presentation accessibility element across two modal lifecycles.
+        let currentHeader = artwork(0, header: true, app: app)
+        XCTAssertTrue(currentHeader.waitForExistence(timeout: 10))
+        let exitPhase = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", "封面暂未载入"), object: currentHeader)
+        XCTAssertEqual(XCTWaiter.wait(for: [exitPhase], timeout: 20), .completed)
         XCTAssertFalse(app.buttons[diagnosticID(0)].exists, "account loss hides the old diagnostic entry")
         XCTAssertFalse(app.buttons[diagnosticID(0) + ".copy"].exists)
-        square(header, expected: 210)
+        square(currentHeader, expected: 210)
     }
 
     @MainActor func testMissingThumbnailAndRetryDiagnosticsStayRequestScopedAfterCancellation() {
