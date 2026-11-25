@@ -146,7 +146,7 @@ private enum ServerArtworkPhase: Equatable {
                                 .font(.system(size: size * 0.38, weight: .regular))
                                 .foregroundStyle(.secondary)
                             if let image {
-                                Image(uiImage: image).resizable().scaledToFill()
+                                ServerArtworkImage(image: image)
                                     .frame(width: geometry.size.width, height: geometry.size.height)
                                     .clipped()
                             }
@@ -193,6 +193,37 @@ private enum ServerArtworkPhase: Equatable {
         }
         .onChange(of: request) { value in state.invalidate(unless: value) }
         .onDisappear { state.cancel() }
+    }
+}
+
+/// A non-intrinsic UIKit container bounds both the rendered image and its
+/// accessibility extent. SwiftUI scaledToFill can report the uncropped image
+/// bounds to accessibility even when its visual drawing is clipped.
+@MainActor private struct ServerArtworkImage: UIViewRepresentable {
+    let image: UIImage
+    func makeUIView(context: Context) -> UIView {
+        let container = UIView()
+        container.clipsToBounds = true
+        container.isAccessibilityElement = false
+        let imageView = UIImageView()
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        imageView.contentMode = .scaleAspectFill
+        imageView.clipsToBounds = true
+        imageView.isAccessibilityElement = false
+        container.addSubview(imageView)
+        NSLayoutConstraint.activate([
+            imageView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            imageView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            imageView.topAnchor.constraint(equalTo: container.topAnchor),
+            imageView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        ])
+        return container
+    }
+    func updateUIView(_ uiView: UIView, context: Context) {
+        (uiView.subviews.first as? UIImageView)?.image = image
+    }
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: UIView, context: Context) -> CGSize? {
+        CGSize(width: proposal.width ?? 0, height: proposal.height ?? 0)
     }
 }
 

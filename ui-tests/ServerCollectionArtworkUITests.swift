@@ -33,6 +33,9 @@ final class ServerCollectionArtworkUITests: XCTestCase {
         value("已载入服务器封面", element: landscape)
         value("服务器未提供封面", element: missing)
         value("已载入服务器封面", element: portrait)
+        // Validate again after decoding: loaded aspect-fill pixels must not
+        // expand the original placeholder's geometry or accessibility region.
+        for element in [first, landscape, missing, portrait] { square(element, expected: 60) }
         XCTAssertEqual(first.frame.width, landscape.frame.width, accuracy: 1)
         XCTAssertEqual(missing.frame.width, portrait.frame.width, accuracy: 1)
         XCTAssertTrue(app.buttons["serverCoverFixture.row.0"].exists || app.descendants(matching: .any).matching(identifier: "serverCoverFixture.row.0").firstMatch.exists)
