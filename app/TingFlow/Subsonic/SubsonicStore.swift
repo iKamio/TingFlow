@@ -67,6 +67,12 @@ final class SubsonicStore: ObservableObject {
         return "Subsonic"
     }
 
+    var artworkService: ServerArtworkDiagnostic.Service {
+        if let auth { return auth.credential.navidrome ? .navidrome : .subsonic }
+        if let restoring { return restoring.navidrome ? .navidrome : .subsonic }
+        return .subsonic
+    }
+
     func signIn(baseURL: String, username: String, password: String, navidrome: Bool) async {
         let ticket = beginNewSession()
         do {
@@ -185,10 +191,18 @@ final class SubsonicStore: ObservableObject {
     }
 
     func artwork(for album: SubsonicAlbum, pixels: Int = 320) async throws -> Data? {
-        try await collectionArtwork(id: album.id, revision: album.coverArtID, scope: album.accountScope, playlist: false, pixels: pixels)
+        do { return try await artworkResult(for: album, pixels: pixels).data }
+        catch let failure as ServerArtworkDiagnosticFailure { throw SubsonicFailure.artwork(failure.diagnostic) }
     }
     func artwork(for playlist: SubsonicPlaylist, pixels: Int = 320) async throws -> Data? {
-        try await collectionArtwork(id: playlist.id, revision: playlist.coverArtID, scope: playlist.accountScope, playlist: true, pixels: pixels)
+        do { return try await artworkResult(for: playlist, pixels: pixels).data }
+        catch let failure as ServerArtworkDiagnosticFailure { throw SubsonicFailure.artwork(failure.diagnostic) }
+    }
+    func artworkResult(for album: SubsonicAlbum, pixels: Int = 320) async throws -> ServerArtworkResult {
+        try await collectionArtworkResult(id: album.id, revision: album.coverArtID, scope: album.accountScope, playlist: false, pixels: pixels)
+    }
+    func artworkResult(for playlist: SubsonicPlaylist, pixels: Int = 320) async throws -> ServerArtworkResult {
+        try await collectionArtworkResult(id: playlist.id, revision: playlist.coverArtID, scope: playlist.accountScope, playlist: true, pixels: pixels)
     }
     private func verifyArtwork(_ context: Context, id: String, revision: String?, scope: String, playlist: Bool) throws {
         try current(context)
@@ -202,26 +216,52 @@ final class SubsonicStore: ObservableObject {
                   item.coverArtID == revision else { throw SubsonicFailure.account }
         }
     }
-    private func collectionArtwork(id: String, revision: String?, scope: String, playlist: Bool, pixels: Int) async throws -> Data? {
-        let context = try context(for: scope)
-        try verifyArtwork(context, id: id, revision: revision, scope: scope, playlist: playlist)
-        guard let revision else { return nil }
+    private func collectionArtworkResult(id: String, revision: String?, scope: String, playlist: Bool, pixels: Int) async throws -> ServerArtworkResult {
+        try Task.checkCancellation()
+        var local = ServerArtworkDiagnostic(service: artworkService, pixels: pixels)
+        local.origin = .metadata
+        let context: Context
+        do {
+            context = try self.context(for: scope)
+            try verifyArtwork(context, id: id, revision: revision, scope: scope, playlist: playlist)
+        } catch is CancellationError { throw CancellationError() }
+        catch {
+            local.issue = auth == nil ? .signedOut : .invalidContext
+            throw ServerArtworkDiagnosticFailure(diagnostic: local)
+        }
+        guard let revision else {
+            local.issue = .missingID
+            return ServerArtworkResult(data: nil, diagnostic: local)
+        }
         let size = ServerArtworkCache.pixels(pixels)
         let key = ServerArtworkCache.Key(scope: "subsonic:" + scope + (playlist ? ":playlist" : ":album"), id: id, revision: SubsonicPolicy.artworkRevision(revision), pixels: size)
+        // This observation belongs only to the loader started by this call.
+        // Cache hits/shared flights must not reuse another request's HTTP/code.
+        var observation: ServerArtworkDiagnostic?
         do {
             let data = try await artworkCache.data(for: key) { [weak self] in
                 guard let self else { throw CancellationError() }
                 try self.verifyArtwork(context, id: id, revision: revision, scope: scope, playlist: playlist)
-                let result = try await context.client.artwork(id: revision, credential: context.credential, pixels: size)
+                let result = try await context.client.artworkResult(id: revision, credential: context.credential, pixels: size)
                 try self.verifyArtwork(context, id: id, revision: revision, scope: scope, playlist: playlist)
-                return result
+                observation = result.diagnostic
+                return result.data
             }
             try verifyArtwork(context, id: id, revision: revision, scope: scope, playlist: playlist)
-            return data
+            var diagnostic = observation ?? ServerArtworkDiagnostic(service: context.credential.navidrome ? .navidrome : .subsonic, pixels: size)
+            if observation == nil {
+                diagnostic.origin = .cacheOrShared
+                diagnostic.stage = .completed
+                diagnostic.issue = data == nil ? .notFound : .none
+                diagnostic.bytesReceived = data?.count ?? 0
+            }
+            return ServerArtworkResult(data: data, diagnostic: diagnostic)
         } catch {
             try current(context)
             if error is CancellationError { throw CancellationError() }
-            throw SubsonicFailure.safe(error)
+            if let failure = error as? ServerArtworkDiagnosticFailure { throw failure }
+            local.issue = (error as? SubsonicFailure) == .account ? .invalidContext : .unknown
+            throw ServerArtworkDiagnosticFailure(diagnostic: local)
         }
     }
 

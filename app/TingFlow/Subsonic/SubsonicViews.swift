@@ -114,11 +114,14 @@ struct SubsonicAccountView: View {
                                                           artworkVersion: album.coverArtID)
                     NavigationLink {
                         SubsonicCollectionView(store: store, collection: collection, onPlay: onPlay,
-                                               artwork: { pixels in try await store.artwork(for: album, pixels: pixels) }) {
+                                               artwork: { pixels in try await store.artwork(for: album, pixels: pixels) },
+                                               diagnosticArtwork: { pixels in try await store.artworkResult(for: album, pixels: pixels) }) {
                             try await store.tracks(in: album)
                         }
                     } label: {
-                        ServerCollectionRow(collection: collection, scope: store.isSignedIn ? store.scopeID : nil) { pixels in
+                        ServerCollectionRow(collection: collection, scope: store.isSignedIn ? store.scopeID : nil,
+                                            diagnosticLoad: { pixels in try await store.artworkResult(for: album, pixels: pixels) },
+                                            diagnosticService: store.artworkService) { pixels in
                             try await store.artwork(for: album, pixels: pixels)
                         }
                     }
@@ -141,11 +144,14 @@ struct SubsonicAccountView: View {
                                                           artworkVersion: playlist.coverArtID)
                     NavigationLink {
                         SubsonicCollectionView(store: store, collection: collection, onPlay: onPlay,
-                                               artwork: { pixels in try await store.artwork(for: playlist, pixels: pixels) }) {
+                                               artwork: { pixels in try await store.artwork(for: playlist, pixels: pixels) },
+                                               diagnosticArtwork: { pixels in try await store.artworkResult(for: playlist, pixels: pixels) }) {
                             try await store.tracks(in: playlist)
                         }
                     } label: {
-                        ServerCollectionRow(collection: collection, scope: store.isSignedIn ? store.scopeID : nil) { pixels in
+                        ServerCollectionRow(collection: collection, scope: store.isSignedIn ? store.scopeID : nil,
+                                            diagnosticLoad: { pixels in try await store.artworkResult(for: playlist, pixels: pixels) },
+                                            diagnosticService: store.artworkService) { pixels in
                             try await store.artwork(for: playlist, pixels: pixels)
                         }
                     }
@@ -196,6 +202,7 @@ private struct SubsonicSongRow: View {
     let collection: ServerCollectionInfo
     let onPlay: ([Song], Int) -> Void
     let artwork: @MainActor (Int) async throws -> Data?
+    let diagnosticArtwork: @MainActor (Int) async throws -> ServerArtworkResult
     let load: () async throws -> [Song]
     @State private var tracks: [Song] = []
     @State private var loading = false
@@ -208,7 +215,9 @@ private struct SubsonicSongRow: View {
     var body: some View {
         List {
             Section {
-                ServerCollectionHeader(collection: collection, scope: store.isSignedIn ? store.scopeID : nil, load: artwork)
+                ServerCollectionHeader(collection: collection, scope: store.isSignedIn ? store.scopeID : nil,
+                                       diagnosticLoad: diagnosticArtwork, diagnosticService: store.artworkService,
+                                       load: artwork)
             }
             .listRowBackground(Color.clear)
             .listRowSeparator(.hidden)

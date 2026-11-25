@@ -40,13 +40,17 @@ struct ServerCollectionInfo {
 @MainActor struct ServerCollectionRow: View {
     let collection: ServerCollectionInfo
     let scope: String?
+    var diagnosticLoad: (@MainActor (Int) async throws -> ServerArtworkResult)? = nil
+    var diagnosticService: ServerArtworkDiagnostic.Service? = nil
+    // Keep the Data-only loader last for existing Emby/fixture trailing closures.
     let load: @MainActor (Int) async throws -> Data?
 
     var body: some View {
         HStack(spacing: 12) {
             ServerArtworkView(key: collection.artworkKey, scope: collection.activeScope(scope),
                               symbol: collection.kind.symbol, pixels: 180, size: 60,
-                              accessibilityID: collection.accessibilityID + ".artwork", load: load)
+                              accessibilityID: collection.accessibilityID + ".artwork",
+                              diagnosticLoad: diagnosticLoad, diagnosticService: diagnosticService, load: load)
             VStack(alignment: .leading, spacing: 4) {
                 Text(collection.title).foregroundStyle(.primary).lineLimit(2)
                 if let metadata = collection.metadata {
@@ -65,6 +69,9 @@ struct ServerCollectionInfo {
 @MainActor struct ServerCollectionHeader: View {
     let collection: ServerCollectionInfo
     let scope: String?
+    var diagnosticLoad: (@MainActor (Int) async throws -> ServerArtworkResult)? = nil
+    var diagnosticService: ServerArtworkDiagnostic.Service? = nil
+    // Keep the Data-only loader last for existing Emby/fixture trailing closures.
     let load: @MainActor (Int) async throws -> Data?
 
     var body: some View {
@@ -72,7 +79,8 @@ struct ServerCollectionInfo {
             ServerArtworkView(key: collection.artworkKey, scope: collection.activeScope(scope),
                               symbol: collection.kind.symbol, pixels: 630, size: 210, corner: 18,
                               showsStatus: true,
-                              accessibilityID: collection.accessibilityID + ".header.artwork", load: load)
+                              accessibilityID: collection.accessibilityID + ".header.artwork",
+                              diagnosticLoad: diagnosticLoad, diagnosticService: diagnosticService, load: load)
             Text(collection.title).font(.title2.weight(.semibold)).foregroundStyle(.primary)
                 .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
                 .accessibilityIdentifier(collection.accessibilityID + ".header.title")
@@ -118,9 +126,12 @@ private enum ServerArtworkPhase: Equatable {
     var corner: CGFloat = 9
     var showsStatus = false
     var accessibilityID = "serverArtwork"
+    var diagnosticLoad: (@MainActor (Int) async throws -> ServerArtworkResult)? = nil
+    var diagnosticService: ServerArtworkDiagnostic.Service? = nil
     let load: @MainActor (Int) async throws -> Data?
     @StateObject private var state = ServerArtworkState()
     @State private var retry = 0
+    @State private var showsDiagnostic = false
 
     private var request: ServerArtworkRequest {
         ServerArtworkRequest(key: key, scope: scope, pixels: min(max(pixels, 1), 700), retry: retry)
@@ -130,6 +141,12 @@ private enum ServerArtworkPhase: Equatable {
     private var isCurrent: Bool { scope != nil && state.request == request }
     private var image: UIImage? { isCurrent ? state.image : nil }
     private var phase: ServerArtworkPhase { isCurrent ? state.phase : .idle }
+    private var diagnostic: ServerArtworkDiagnostic? { isCurrent ? state.diagnostic : nil }
+    // The binding also refuses stale presentation before onChange can run.
+    private var diagnosticPresentation: Binding<Bool> {
+        Binding(get: { showsDiagnostic && diagnostic != nil },
+                set: { showsDiagnostic = $0 })
+    }
 
     var body: some View {
         VStack(spacing: 6) {
@@ -185,14 +202,30 @@ private enum ServerArtworkPhase: Equatable {
                     .accessibilityIdentifier(accessibilityID + ".retry")
                 }
             }
+            if showsStatus, diagnostic != nil {
+                Button("查看封面诊断") { showsDiagnostic = true }
+                    .font(.caption).frame(minWidth: 44, minHeight: 44)
+                    .buttonStyle(.borderless)
+                    .accessibilityIdentifier(accessibilityID + ".diagnostic")
+            }
         }
         .frame(width: size)
+        .sheet(isPresented: diagnosticPresentation) {
+            if let diagnostic {
+                ServerArtworkDiagnosticView(diagnostic: diagnostic,
+                                            accessibilityID: accessibilityID + ".diagnostic")
+            }
+        }
         .task(id: request) {
             guard !Task.isCancelled else { return }
-            state.start(request, load: load)
+            state.start(request, diagnosticLoad: diagnosticLoad,
+                        diagnosticService: diagnosticService, load: load)
         }
-        .onChange(of: request) { value in state.invalidate(unless: value) }
-        .onDisappear { state.cancel() }
+        .onChange(of: request) { value in
+            showsDiagnostic = false
+            state.invalidate(unless: value)
+        }
+        .onDisappear { showsDiagnostic = false; state.cancel() }
     }
 }
 
@@ -231,6 +264,7 @@ private enum ServerArtworkPhase: Equatable {
     @Published private(set) var request: ServerArtworkRequest?
     @Published private(set) var image: UIImage?
     @Published private(set) var phase: ServerArtworkPhase = .idle
+    @Published private(set) var diagnostic: ServerArtworkDiagnostic?
     private var generation = UUID()
     private var worker: Task<Void, Never>?
     private var watchdog: Task<Void, Never>?
@@ -242,9 +276,12 @@ private enum ServerArtworkPhase: Equatable {
         generation = UUID()
         worker?.cancel(); watchdog?.cancel()
         worker = nil; watchdog = nil
-        image = nil; request = nil; phase = .idle
+        image = nil; diagnostic = nil; request = nil; phase = .idle
     }
-    func start(_ next: ServerArtworkRequest, load: @escaping @MainActor (Int) async throws -> Data?) {
+    func start(_ next: ServerArtworkRequest,
+               diagnosticLoad: (@MainActor (Int) async throws -> ServerArtworkResult)? = nil,
+               diagnosticService: ServerArtworkDiagnostic.Service? = nil,
+               load: @escaping @MainActor (Int) async throws -> Data?) {
         cancel()
         request = next
         guard let scope = next.scope, !scope.isEmpty else { return }
@@ -253,20 +290,45 @@ private enum ServerArtworkPhase: Equatable {
         worker = Task { @MainActor [weak self] in
             do {
                 try Task.checkCancellation()
-                let data = try await load(next.pixels)
+                let data: Data?
+                let diagnostic: ServerArtworkDiagnostic?
+                // Select exactly one loader; the Data-only adapter must not
+                // cause a second authenticated request when diagnostics exist.
+                if let diagnosticLoad {
+                    let result = try await diagnosticLoad(next.pixels)
+                    data = result.data; diagnostic = result.diagnostic
+                } else {
+                    data = try await load(next.pixels); diagnostic = nil
+                }
                 try Task.checkCancellation()
                 guard let self, self.generation == ticket, self.request == next else { return }
+                self.diagnostic = diagnostic
                 if let data {
                     if let image = Self.thumbnail(data, pixels: next.pixels) {
                         self.image = image; self.phase = .loaded
-                    } else { self.phase = .failed }
+                    } else {
+                        // Preserve observed HTTP/API/format fields; this is a
+                        // separate UI decoding failure, not a server diagnosis.
+                        var failure = diagnostic ?? Self.uiDiagnostic(service: diagnosticService,
+                                                                       pixels: next.pixels,
+                                                                       stage: .thumbnail, issue: .thumbnail)
+                        failure?.stage = .thumbnail; failure?.issue = .thumbnail
+                        self.diagnostic = failure; self.phase = .failed
+                    }
                 } else { self.phase = .missing }
             } catch is CancellationError {
                 guard let self, self.generation == ticket, self.request == next else { return }
-                self.phase = .idle
+                self.cancel()
+                return
+            } catch let failure as ServerArtworkDiagnosticFailure {
+                guard let self, !Task.isCancelled, self.generation == ticket, self.request == next else { return }
+                self.diagnostic = failure.diagnostic
+                self.phase = failure.diagnostic.issue == .notFound ? .missing : .failed
             } catch {
                 guard let self, !Task.isCancelled, self.generation == ticket, self.request == next else { return }
-                // No raw errors, URLs, or credentials are ever displayed here.
+                // Never display or retain unknown Error/localizedDescription.
+                self.diagnostic = Self.uiDiagnostic(service: diagnosticService, pixels: next.pixels,
+                                                    stage: .request, issue: .unknown)
                 self.phase = .failed
             }
             guard let self, self.generation == ticket, self.request == next else { return }
@@ -281,7 +343,19 @@ private enum ServerArtworkPhase: Equatable {
             self.generation = UUID()
             self.worker?.cancel(); self.worker = nil; self.watchdog = nil
             self.image = nil; self.phase = .failed
+            // A UI deadline has no observed HTTP or Subsonic code. Never
+            // recycle a previous result or label it as a missing server cover.
+            self.diagnostic = Self.uiDiagnostic(service: diagnosticService, pixels: next.pixels,
+                                                stage: .uiDeadline, issue: .uiDeadline)
         }
+    }
+    private static func uiDiagnostic(service: ServerArtworkDiagnostic.Service?, pixels: Int,
+                                     stage: ServerArtworkDiagnostic.Stage,
+                                     issue: ServerArtworkDiagnostic.Issue) -> ServerArtworkDiagnostic? {
+        guard let service else { return nil } // Data-only Emby views have no Subsonic diagnostic.
+        var diagnostic = ServerArtworkDiagnostic(service: service, pixels: pixels)
+        diagnostic.origin = .ui; diagnostic.stage = stage; diagnostic.issue = issue
+        return diagnostic
     }
     private static func thumbnail(_ data: Data, pixels: Int) -> UIImage? {
         guard data.count <= 4_000_000,

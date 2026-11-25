@@ -39,6 +39,18 @@ enum SubsonicFailure: Error, LocalizedError, Equatable {
         }
     }
     static func safe(_ error: Error) -> SubsonicFailure { error as? SubsonicFailure ?? .network }
+    static func artwork(_ diagnostic: ServerArtworkDiagnostic) -> SubsonicFailure {
+        switch diagnostic.issue {
+        case .authentication: return .authentication
+        case .permission: return .forbidden
+        case .redirect: return .redirect
+        case .tooLarge: return .artworkLimit
+        case .invalidContext: return .account
+        case .signedOut: return .signedOut
+        case .tls, .timedOut, .network, .uiDeadline: return .network
+        default: return .response
+        }
+    }
 }
 
 enum SubsonicPolicy {
@@ -265,42 +277,108 @@ final class SubsonicClient {
         }
     }
     func artwork(id: String, credential: SubsonicCredential, pixels: Int = 320) async throws -> Data? {
+        do { return try await artworkResult(id: id, credential: credential, pixels: pixels).data }
+        catch let failure as ServerArtworkDiagnosticFailure { throw SubsonicFailure.artwork(failure.diagnostic) }
+    }
+    /// Each attempt returns its own safe value. There is no shared last-error state
+    /// for a cancelled/recycled row to overwrite, and raw server messages are never decoded.
+    func artworkResult(id: String, credential: SubsonicCredential, pixels: Int = 320) async throws -> ServerArtworkResult {
+        var diagnostic = ServerArtworkDiagnostic(service: credential.navidrome ? .navidrome : .subsonic, pixels: pixels)
         do {
             try Task.checkCancellation()
-            guard credential.valid, credential.server == base, SubsonicPolicy.validArtworkID(id) else { throw SubsonicFailure.account }
+            guard credential.valid, credential.server == base, SubsonicPolicy.validArtworkID(id) else {
+                diagnostic.issue = .invalidContext
+                throw ServerArtworkDiagnosticFailure(diagnostic: diagnostic)
+            }
             let url = try SubsonicPolicy.endpoint(base, "getCoverArt")
             var request = URLRequest(url: url)
             request.httpShouldHandleCookies = false
             request.httpMethod = "POST"
             request.httpBody = SubsonicPolicy.form(credential.parameters + [
-                URLQueryItem(name: "id", value: id), URLQueryItem(name: "size", value: pixels <= 320 ? "320" : "700")])
+                URLQueryItem(name: "id", value: id), URLQueryItem(name: "size", value: String(diagnostic.pixels))])
             request.setValue("application/x-www-form-urlencoded; charset=utf-8", forHTTPHeaderField: "Content-Type")
             request.setValue(SubsonicArtworkBody.accept, forHTTPHeaderField: "Accept")
+            diagnostic.stage = .request
             let (bytes, response) = try await session.bytes(for: request)
             defer { bytes.task.cancel() }
-            guard let http = response as? HTTPURLResponse, response.url == url else { throw SubsonicFailure.redirect }
-            switch http.statusCode {
-            case 200..<300: break
-            case 404: return nil
-            case 300..<400: throw SubsonicFailure.redirect
-            case 401: throw SubsonicFailure.authentication
-            case 403: throw SubsonicFailure.forbidden
-            default: throw SubsonicFailure.network
+            diagnostic.stage = .headers
+            guard let http = response as? HTTPURLResponse else {
+                diagnostic.issue = .http; throw ServerArtworkDiagnosticFailure(diagnostic: diagnostic)
             }
-            // Validate the declared wire type, not URLResponse's possible content sniffing.
-            guard let mime = http.value(forHTTPHeaderField: "Content-Type")?.components(separatedBy: ";").first?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-                  SubsonicArtworkBody.types[mime] != nil else { throw SubsonicFailure.response }
-            guard response.expectedContentLength <= Int64(SubsonicArtworkBody.byteLimit) else { throw SubsonicFailure.artworkLimit }
+            diagnostic.httpStatus = http.statusCode
+            diagnostic.expectedBytes = response.expectedContentLength
+            diagnostic.mime = ServerArtworkDiagnostic.MIME.classify(http.value(forHTTPHeaderField: "Content-Type"))
+            guard response.url == url, !(300..<400).contains(http.statusCode) else {
+                diagnostic.issue = .redirect; throw ServerArtworkDiagnosticFailure(diagnostic: diagnostic)
+            }
+            if http.statusCode == 404 {
+                diagnostic.issue = .notFound
+                return ServerArtworkResult(data: nil, diagnostic: diagnostic)
+            }
+            let successfulHTTP = (200..<300).contains(http.statusCode)
+            if !successfulHTTP && diagnostic.mime != .json {
+                diagnostic.issue = http.statusCode == 401 ? .authentication : (http.statusCode == 403 ? .permission : .http)
+                throw ServerArtworkDiagnosticFailure(diagnostic: diagnostic)
+            }
+            guard diagnostic.mime.isImage || diagnostic.mime == .json else {
+                diagnostic.issue = .unexpectedMIME; throw ServerArtworkDiagnosticFailure(diagnostic: diagnostic)
+            }
+            let limit = diagnostic.mime == .json ? 65_536 : SubsonicArtworkBody.byteLimit
+            guard response.expectedContentLength <= Int64(limit) else {
+                diagnostic.issue = .tooLarge; throw ServerArtworkDiagnosticFailure(diagnostic: diagnostic)
+            }
+            diagnostic.stage = .body
             var data = Data()
             for try await byte in bytes {
-                guard data.count < SubsonicArtworkBody.byteLimit else { throw SubsonicFailure.artworkLimit }
-                data.append(byte)
+                guard data.count < limit else {
+                    diagnostic.issue = .tooLarge; throw ServerArtworkDiagnosticFailure(diagnostic: diagnostic)
+                }
+                data.append(byte); diagnostic.bytesReceived = data.count
             }
             try Task.checkCancellation()
-            guard SubsonicArtworkBody.valid(data, mime: mime) else { throw SubsonicFailure.response }
-            return data
+            if diagnostic.mime == .json {
+                diagnostic.stage = .api
+                guard let envelope = ServerArtworkDiagnostic.apiEnvelope(data) else {
+                    diagnostic.apiStatus = .invalid
+                    diagnostic.issue = .invalidEnvelope
+                    throw ServerArtworkDiagnosticFailure(diagnostic: diagnostic)
+                }
+                diagnostic.apiStatus = envelope.status; diagnostic.apiCode = envelope.code
+                if envelope.status == .failed {
+                    diagnostic.issue = ServerArtworkDiagnostic.apiIssue(envelope.code)
+                    // Subsonic often reports missing artwork with HTTP 200/code70.
+                    // An HTTP authentication failure can never become a missing image.
+                    if successfulHTTP && envelope.code == 70 {
+                        return ServerArtworkResult(data: nil, diagnostic: diagnostic)
+                    }
+                } else { diagnostic.issue = .invalidEnvelope }
+                if !successfulHTTP && http.statusCode == 401 { diagnostic.issue = .authentication }
+                if !successfulHTTP && http.statusCode == 403 { diagnostic.issue = .permission }
+                throw ServerArtworkDiagnosticFailure(diagnostic: diagnostic)
+            }
+            diagnostic.stage = .imageContainer
+            if let issue = SubsonicArtworkBody.validationIssue(data, mime: diagnostic.mime.rawValue, diagnostic: &diagnostic) {
+                diagnostic.issue = issue; throw ServerArtworkDiagnosticFailure(diagnostic: diagnostic)
+            }
+            diagnostic.stage = .completed
+            return ServerArtworkResult(data: data, diagnostic: diagnostic)
         } catch is CancellationError { throw CancellationError() }
-        catch { if Task.isCancelled { throw CancellationError() }; throw SubsonicFailure.safe(error) }
+        catch let failure as ServerArtworkDiagnosticFailure { throw failure }
+        catch let error as URLError {
+            if Task.isCancelled || error.code == .cancelled { throw CancellationError() }
+            switch error.code {
+            case .timedOut: diagnostic.issue = .timedOut
+            case .secureConnectionFailed, .serverCertificateHasBadDate, .serverCertificateUntrusted,
+                 .serverCertificateHasUnknownRoot, .serverCertificateNotYetValid,
+                 .clientCertificateRejected, .clientCertificateRequired: diagnostic.issue = .tls
+            default: diagnostic.issue = .network
+            }
+            throw ServerArtworkDiagnosticFailure(diagnostic: diagnostic)
+        } catch {
+            if Task.isCancelled { throw CancellationError() }
+            diagnostic.issue = diagnostic.stage == .validation ? .invalidContext : .network
+            throw ServerArtworkDiagnosticFailure(diagnostic: diagnostic)
+        }
     }
     func playback(id: String, credential: SubsonicCredential) throws -> PlaybackResource {
         guard credential.valid, credential.server == base, SubsonicPolicy.validID(id) else { throw SubsonicFailure.account }
@@ -319,18 +397,23 @@ private enum SubsonicArtworkBody {
         "image/heic": ["public.heic", "public.heif"], "image/heif": ["public.heif", "public.heic"]
     ]
     static let accept = "image/jpeg, image/png, image/webp, image/heic, image/heif, image/gif"
-    static func valid(_ data: Data, mime: String) -> Bool {
-        guard !data.isEmpty, data.count <= byteLimit,
-              let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
-              let type = CGImageSourceGetType(source), types[mime]?.contains(type as String) == true,
+    static func validationIssue(_ data: Data, mime: String, diagnostic: inout ServerArtworkDiagnostic) -> ServerArtworkDiagnostic.Issue? {
+        diagnostic.stage = .imageContainer
+        guard !data.isEmpty else { return .empty }
+        guard data.count <= byteLimit else { return .tooLarge }
+        guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary) else { return .invalidContainer }
+        let type = CGImageSourceGetType(source).map { $0 as String }
+        diagnostic.imageFormat = ServerArtworkDiagnostic.ImageFormat.classify(type)
+        guard let type, types[mime]?.contains(type) == true,
               CGImageSourceGetCount(source) > 0,
               CGImageSourceGetStatus(source) == .statusComplete,
               CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete,
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any],
               let width = properties[kCGImagePropertyPixelWidth as String] as? NSNumber,
-              let height = properties[kCGImagePropertyPixelHeight as String] as? NSNumber
-        else { return false }
+              let height = properties[kCGImagePropertyPixelHeight as String] as? NSNumber else { return .invalidContainer }
+        diagnostic.stage = .imageDimensions
         let w = width.int64Value, h = height.int64Value
-        return (1...16_384).contains(w) && (1...16_384).contains(h) && w * h <= 80_000_000
+        guard (1...16_384).contains(w), (1...16_384).contains(h), w * h <= 80_000_000 else { return .dimensions }
+        return nil
     }
 }

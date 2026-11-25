@@ -162,6 +162,10 @@ import Foundation
             } catch {
                 if Task.isCancelled || error is CancellationError {
                     result = .failure(CancellationError())
+                } else if let failure = error as? ServerArtworkDiagnosticFailure {
+                    // One allowlisted value type only; never forward an arbitrary
+                    // underlying Error, server message, URL or credential.
+                    result = .failure(failure)
                 } else {
                     result = .failure(Failure.invalidData)
                 }
