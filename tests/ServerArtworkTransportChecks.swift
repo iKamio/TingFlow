@@ -153,11 +153,11 @@ private final class ArtworkFixture: URLProtocol, @unchecked Sendable {
             .init(target: URL(string: "https://outside.invalid/image")),
             .init(target: URL(string: "https://artwork.example.invalid/other"))
         ]
-        for reply in failures {
+        for (index, reply) in failures.enumerated() {
             ArtworkFixture.set(reply)
             let before = ArtworkFixture.artworkCount()
-            await rejected(embyImage, "Emby rejects invalid binary/status/target")
-            await rejected(subImage, "Subsonic rejects invalid binary/status/target")
+            await rejected(embyImage, "Emby rejects invalid binary/status/target #\(index)")
+            await rejected(subImage, "Subsonic rejects invalid binary/status/target #\(index)")
             check(ArtworkFixture.artworkCount() == before + 2, "no follow-up, alternate target or retry")
         }
         ArtworkFixture.set(.init(status: 404, hold: true))

@@ -398,6 +398,7 @@ private enum EmbyArtworkBody {
               let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
               let type = CGImageSourceGetType(source), types[mime]?.contains(type as String) == true,
               CGImageSourceGetCount(source) > 0,
+              CGImageSourceGetStatus(source) == .statusComplete,
               CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete,
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any],
               let width = properties[kCGImagePropertyPixelWidth as String] as? NSNumber,
