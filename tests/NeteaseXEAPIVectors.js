@@ -55,6 +55,14 @@ function hkdf16(shared, eph) {
   const prk = crypto.createHmac('sha256', Buffer.alloc(32)).update(shared.length ? shared : Buffer.alloc(32)).digest();
   return crypto.createHmac('sha256', prk).update(Buffer.concat([eph, Buffer.from([1])])).digest().subarray(0, 16);
 }
+function portableGzip(input, options) {
+  const compressed = zlib.gzipSync(input, options);
+  // RFC 1952 OS is informational. Linux emits 3 and Darwin emits 19;
+  // freeze it as Unix so exact cipher fixtures stay portable without
+  // relaxing any request, signature, plaintext or decompression assertion.
+  compressed[9] = 3;
+  return compressed;
+}
 function makeVector() {
   const peerPriv = rawPrivate(FIXED.peerPrivate), peerPub = rawPublic(peerPriv);
   const ephPriv = rawPrivate(FIXED.ephemeralPrivate), ephPub = rawPublic(ephPriv);
@@ -84,9 +92,9 @@ function makeVector() {
       signature: sign(FIXED.timestamp, FIXED.nonce).toString('base64') }
   };
   const responseBytes = Buffer.from(JSON.stringify(FIXED.response));
-  const compressed = zlib.gzipSync(Buffer.from(JSON.stringify(FIXED.gzipResponse)), { level: 9, mtime: 0 });
+  const compressed = portableGzip(Buffer.from(JSON.stringify(FIXED.gzipResponse)), { level: 9, mtime: 0 });
   const overLimitPlain = Buffer.from(JSON.stringify({ code: 200, data: { value: 'A'.repeat(2 * 1024 * 1024 + 1) } }));
-  const overLimitGzip = zlib.gzipSync(overLimitPlain, { level: 9, mtime: 0 });
+  const overLimitGzip = portableGzip(overLimitPlain, { level: 9, mtime: 0 });
   return {
     provenance: 'synthetic; independently generated with Node built-in crypto/zlib; no service access',
     inputs: FIXED, expected: { peerPublic: peerPub.toString('base64'), requestPlaintext: requestPlaintext(FIXED.payload).toString(),
