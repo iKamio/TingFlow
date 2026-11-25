@@ -67,19 +67,17 @@ private final class ArtworkFixture: URLProtocol, @unchecked Sendable {
         }
         Self.lock.lock(); Self.calls.append(request); let image = Self.reply; Self.lock.unlock()
         if Self.isArtwork(request) {
+            // A held request is paused BEFORE any response callback. Some native
+            // URLProtocol async-byte bridges buffer partial responses until EOF.
+            // This seam verifies task/logout cancellation without relying on that
+            // platform-specific buffering, while completed 404s are checked below.
+            if image.hold { return }
             var headers = ["Content-Type": image.mime, "Location": "https://artwork.example.invalid/redirected", "Set-Cookie": "fixture=synthetic; Secure"]
             if let length = image.length { headers["Content-Length"] = String(length) }
             let response = HTTPURLResponse(url: image.target ?? url, statusCode: image.status, httpVersion: "HTTP/1.1", headerFields: headers)!
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            if image.hold {
-                // URLProtocol's async-byte bridge may wait for a body event before
-                // exposing headers. Supply one byte but keep the stream unfinished:
-                // rejection/logout must still cancel without waiting for completion.
-                client?.urlProtocol(self, didLoad: Data([0]))
-            } else {
-                client?.urlProtocol(self, didLoad: image.data)
-                client?.urlProtocolDidFinishLoading(self)
-            }
+            client?.urlProtocol(self, didLoad: image.data)
+            client?.urlProtocolDidFinishLoading(self)
             return
         }
         let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
@@ -116,13 +114,23 @@ private final class ArtworkFixture: URLProtocol, @unchecked Sendable {
         client?.urlProtocol(self, didReceive: HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: data); client?.urlProtocolDidFinishLoading(self)
     }
-    override func stopLoading() { Self.lock.lock(); Self.stopped += 1; Self.lock.unlock() }
+    override func stopLoading() {
+        guard Self.isArtwork(request) else { return }
+        Self.lock.lock(); Self.stopped += 1; Self.lock.unlock()
+    }
 }
 
 @main @MainActor struct ServerArtworkTransportChecks {
     static func main() async throws {
         var count = 0
         func check(_ value: Bool, _ label: String) { precondition(value, "FAIL: " + label); count += 1 }
+        func waitUntil(_ condition: () -> Bool) async {
+            let deadline = Date().addingTimeInterval(5)
+            while !condition() {
+                precondition(Date() < deadline, "FAIL: bounded artwork lifecycle callback timed out")
+                try? await Task.sleep(nanoseconds: 1_000_000)
+            }
+        }
         func rejected(_ load: () async throws -> Data?, _ label: String) async {
             do { _ = try await load(); preconditionFailure("FAIL: " + label) }
             catch { check(error is EmbyFailure || error is SubsonicFailure || error is CancellationError, label + " safe error") }
@@ -168,13 +176,12 @@ private final class ArtworkFixture: URLProtocol, @unchecked Sendable {
             await rejected(subImage, "Subsonic rejects invalid binary/status/target #\(index)")
             check(ArtworkFixture.artworkCount() == before + 2, "no follow-up, alternate target or retry")
         }
-        print("PASS: server artwork declared MIME, binary bounds and redirect rejection cases")
-        ArtworkFixture.set(.init(status: 404, hold: true))
-        let beforeStop = ArtworkFixture.stops()
+        FileHandle.standardError.write(Data("PASS: declared MIME, binary bounds and redirect rejection cases\n".utf8))
+        ArtworkFixture.set(.init(status: 404))
+        let before404 = ArtworkFixture.artworkCount()
         check(try await embyImage() == nil, "authenticated 404 only returns nil")
         check(try await subImage() == nil, "Subsonic 404 returns nil")
-        for _ in 0..<1000 { if ArtworkFixture.stops() >= beforeStop + 2 { break }; await Task.yield() }
-        check(ArtworkFixture.stops() >= beforeStop + 2, "404 header early return cancels both byte tasks")
+        check(ArtworkFixture.artworkCount() == before404 + 2, "missing images never retry or use alternate targets")
         ArtworkFixture.set()
         let beforeUnsafe = ArtworkFixture.artworkCount()
         await rejected({ try await emby.artwork(item: "../escape", token: "synthetic", user: "user-a") }, "Emby unsafe item")
@@ -225,10 +232,13 @@ private final class ArtworkFixture: URLProtocol, @unchecked Sendable {
             do { _ = try await e.artwork(for: e.albums[0], pixels: 700); return false }
             catch { return error is CancellationError }
         }
-        for _ in 0..<1000 { if ArtworkFixture.artworkCount() > before { break }; await Task.yield() }
+        await waitUntil { ArtworkFixture.artworkCount() > before }
         check(ArtworkFixture.artworkCount() > before, "Emby pending image began")
+        let stoppedE = ArtworkFixture.stops()
         await e.signOut()
         check(await pendingE.value && !e.isSignedIn, "Emby logout cancels old-account pending bytes")
+        await waitUntil { ArtworkFixture.stops() > stoppedE }
+        check(ArtworkFixture.stops() > stoppedE, "Emby logout reaches the held network task's stopLoading callback")
         await rejected({ try await e.artwork(for: ea) }, "Emby signed-out cached model")
         ArtworkFixture.set()
         await s.signIn(baseURL: base.absoluteString, username: "a", password: "synthetic", navidrome: true)
@@ -255,10 +265,13 @@ private final class ArtworkFixture: URLProtocol, @unchecked Sendable {
             do { _ = try await s.artwork(for: s.albums[0], pixels: 700); return false }
             catch { return error is CancellationError }
         }
-        for _ in 0..<1000 { if ArtworkFixture.artworkCount() > before { break }; await Task.yield() }
+        await waitUntil { ArtworkFixture.artworkCount() > before }
         check(ArtworkFixture.artworkCount() > before, "Subsonic pending image began")
+        let stoppedS = ArtworkFixture.stops()
         await s.signOut()
         check(await pendingS.value && !s.isSignedIn && SecureVault.values.isEmpty, "Subsonic logout drops pending data and synthetic credentials")
+        await waitUntil { ArtworkFixture.stops() > stoppedS }
+        check(ArtworkFixture.stops() > stoppedS, "Subsonic logout reaches the held network task's stopLoading callback")
         await rejected({ try await s.artwork(for: sa) }, "Subsonic signed-out cached model")
         print("PASS: \(count) authenticated server ORIGINAL artwork checks; synthetic data only")
     }
