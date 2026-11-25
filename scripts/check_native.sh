@@ -6,6 +6,8 @@ EMBY=(app/TingFlow/Emby/EmbyClient.swift app/TingFlow/Emby/EmbyPaging.swift app/
 SOURCES=(app/TingFlow/Sources/SourceModels.swift app/TingFlow/Sources/SourceHTTP.swift app/TingFlow/Sources/SourceRuntime.swift app/TingFlow/Sources/SourceStore.swift)
 TMP=${RUNNER_TEMP:-/tmp}
 node --check app/TingFlow/Sources/SourceBootstrap.js
+xcrun swiftc -swift-version 5 app/TingFlow/Sources/SourceFileImport.swift app/TingFlow/Sources/SourceImportSession.swift tests/SourceImportLifecycleChecks.swift -o "$TMP/source-import-lifecycle-checks"
+"$TMP/source-import-lifecycle-checks"
 xcrun swiftc -swift-version 5 app/TingFlow/Core/ServerArtworkDiagnostic.swift app/TingFlow/Core/ServerArtworkCache.swift tests/ServerArtworkCacheChecks.swift -o "$TMP/server-artwork-cache-checks"
 "$TMP/server-artwork-cache-checks"
 xcrun swiftc -swift-version 5 "${CORE[@]}" "${EMBY[@]}" app/TingFlow/Subsonic/SubsonicClient.swift app/TingFlow/Subsonic/SubsonicStore.swift tests/ServerArtworkTransportChecks.swift -o "$TMP/server-artwork-transport-checks"

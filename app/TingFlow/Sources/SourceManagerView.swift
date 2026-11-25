@@ -10,35 +10,37 @@ private enum SourceManagerModal: Identifiable {
         }
     }
 }
-private enum SourceImportStage {
-    case idle, selecting, reading, failed(String)
-}
-
 @MainActor struct SourceManagerView: View {
     @ObservedObject var store: SourceStore
+    @StateObject private var importSession: SourceImportSession
     @State private var modal: SourceManagerModal?
-    @State private var selectedURL: URL?
-    @State private var afterDismissNotice: String?
     @State private var hostText = ""
-    @State private var notice: String?
-    @State private var stage: SourceImportStage = .idle
-    @State private var policy = SourcePickerPolicy()
-    @State private var importTask: Task<Void, Never>?
-    @State private var moving: UUID?
-    private var isReading: Bool { policy.phase == .reading }
-    private let importedMessage = "音源已导入并隔离；尚未运行。请阅读脚本、确认信任并只授权所需域名。"
+    private var stage: SourceImportStage {
+        get { importSession.stage }
+        nonmutating set { importSession.stage = newValue }
+    }
+    private var notice: String? {
+        get { importSession.notice }
+        nonmutating set { importSession.notice = newValue }
+    }
+    private var afterDismissNotice: String? {
+        get { importSession.afterDismissNotice }
+        nonmutating set { importSession.afterDismissNotice = newValue }
+    }
+    private var isReading: Bool { importSession.isReading }
+    init(store: SourceStore) {
+        self.store = store
+        _importSession = StateObject(wrappedValue: SourceImportSession(store: store))
+    }
     var body: some View {
         List {
             Section {
-                Button {
-                    cancelRead(); selectedURL = nil; afterDismissNotice = nil
-                    let ticket = policy.begin(); stage = .selecting; modal = .picker(ticket)
-                } label: {
+                Button { showPicker() } label: {
                     HStack { Label("导入洛雪 JavaScript 音源", systemImage: "plus"); Spacer(); if isReading { ProgressView() } }
-                }.accessibilityIdentifier("source-import").disabled(isReading || modal != nil)
+                }.accessibilityIdentifier("source-import").disabled(isReading || importSession.presentationLocked)
                 Button("粘贴 JavaScript 文本") {
-                    cancelRead(); stage = .idle; modal = .paste(UUID())
-                }.accessibilityIdentifier("source-import-paste").disabled(isReading || modal != nil)
+                    presentModal(.paste(UUID()))
+                }.accessibilityIdentifier("source-import-paste").disabled(isReading || importSession.presentationLocked)
                 switch stage {
                 case .idle: EmptyView()
                 case .selecting:
@@ -78,73 +80,42 @@ private enum SourceImportStage {
         }
         .navigationTitle("自定义音源")
         // One presentation owner for native selection, explicit paste and trust.
-        // Reading starts only in onDismiss, after UIKit has relinquished the modal.
+        // The session joins selection and dismissal in either callback order.
         .sheet(item: $modal, onDismiss: modalDismissed) { route in
             switch route {
             case .picker(let ticket):
-                SourceDocumentPicker { result in
-                    guard ticket == policy.id, policy.phase == .selecting else { return }
-                    switch result {
-                    case .success(let url):
-                        if let url, policy.selected(ticket) { selectedURL = url }
-                        else { policy.cancel(); stage = .idle }
-                    case .failure(let error):
-                        policy.cancel(); stage = .failed(error.localizedDescription)
-                        afterDismissNotice = error.localizedDescription
-                    }
-                    modal = nil
+                if let coordinator = importSession.coordinator(for: ticket) {
+                    SourceDocumentPicker(coordinator: coordinator)
                 }
-            case .paste:
+            case .paste(let id):
                 SourcePasteImportView { file in
-                    try store.importScript(file.data, filename: file.filename)
-                    stage = .idle; afterDismissNotice = importedMessage; modal = nil
+                    try importSession.importPasted(file, presentation: "paste-\(id)")
+                    modal = nil
                 } cancel: { modal = nil }
             case .trust(let source):
                 trustView(source)
             }
         }
-        .onDisappear {
-            cancelRead(); selectedURL = nil; modal = nil; stage = .idle
-        }
+        .background(ownerObserver)
         .alert("音源管理", isPresented: Binding(get: { notice != nil }, set: { if !$0 { notice = nil } })) {
             Button("知道了", role: .cancel) { notice = nil }
         } message: { Text(notice ?? "") }
     }
-    private func cancelRead() {
-        policy.cancel(); importTask?.cancel(); importTask = nil
+    private var ownerObserver: some View {
+        let binding = $modal
+        return SourceImportOwnerObserver(session: importSession, dismiss: { binding.wrappedValue = nil })
+            .frame(width: 0, height: 0)
     }
-    private func modalDismissed() {
-        hostText = ""
-        if let message = afterDismissNotice {
-            afterDismissNotice = nil; notice = message
-        }
-        guard let url = selectedURL, policy.phase == .reading else {
-            selectedURL = nil
-            if policy.phase == .selecting { policy.cancel(); stage = .idle }
-            return
-        }
-        selectedURL = nil
-        let ticket = policy.id; stage = .reading
-        importTask = Task { @MainActor in
-            do {
-                let file = try await SourceFileImport.read(url)
-                try Task.checkCancellation()
-                guard policy.finish(ticket) else { return }
-                importTask = nil
-                try store.importScript(file.data, filename: file.filename)
-                stage = .idle; notice = importedMessage
-            } catch {
-                // finish is intentionally called before committing to the store. A
-                // store error is still visible, but stale/cancelled workers stay silent.
-                guard ticket == policy.id else { return }
-                _ = policy.finish(ticket); importTask = nil
-                if SourceImportFailure.isCancellation(error) { stage = .idle; return }
-                let message = (error as? SourceImportFailure)?.localizedDescription ??
-                    (error as? SourceFailure)?.localizedDescription ?? SourceFailure.storage.localizedDescription
-                stage = .failed(message); notice = message
-            }
-        }
+    private func showPicker() {
+        let binding = $modal
+        if let ticket = importSession.beginPicker(dismiss: { binding.wrappedValue = nil }) { modal = .picker(ticket) }
     }
+    private func presentModal(_ route: SourceManagerModal) {
+        guard importSession.beginPresentation(route.id) else { return }
+        modal = route
+    }
+    private func cancelRead() { importSession.cancelRead() }
+    private func modalDismissed() { hostText = ""; importSession.modalDismissed() }
     private func trustView(_ source: UserSource) -> some View {
         NavigationStack {
             Form {
@@ -171,6 +142,7 @@ private enum SourceImportStage {
                 ToolbarItem(placement: .cancellationAction) { Button("取消") { modal = nil; hostText = "" } }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("信任并启用") {
+                        guard importSession.acceptsPresentation("trust-\(source.id)") else { return }
                         do { try store.trust(source.id, hosts: hostText) }
                         catch { afterDismissNotice = (error as? SourceFailure)?.localizedDescription ?? SourceFailure.permission.localizedDescription }
                         modal = nil; hostText = ""
@@ -211,9 +183,9 @@ private enum SourceImportStage {
                 .font(.caption)
             if source.isTrusted {
                 Button("重新审阅与修改域名") {
-                    guard !isReading, modal == nil else { return }
-                    modal = .trust(source); hostText = source.allowedHosts.joined(separator: ", ")
-                }.font(.caption).disabled(isReading || modal != nil)
+                    guard !isReading, !importSession.presentationLocked else { return }
+                    presentModal(.trust(source)); hostText = source.allowedHosts.joined(separator: ", ")
+                }.font(.caption).disabled(isReading || importSession.presentationLocked)
                 Text("授权域名：\(source.allowedHosts.joined(separator: ", "))")
                     .font(.caption2.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
                 Text(source.capabilities.isEmpty ? "平台/音质声明尚未验证" : source.capabilities.sorted(by: { $0.key < $1.key }).map { key, value in
@@ -227,9 +199,9 @@ private enum SourceImportStage {
                 }.font(.caption)
             } else {
                 Button("审阅脚本并授权域名") {
-                    guard !isReading, modal == nil else { return }
-                    modal = .trust(source); hostText = ""
-                }.font(.subheadline.weight(.semibold)).disabled(isReading || modal != nil)
+                    guard !isReading, !importSession.presentationLocked else { return }
+                    presentModal(.trust(source)); hostText = ""
+                }.font(.subheadline.weight(.semibold)).disabled(isReading || importSession.presentationLocked)
                 Button("删除此隔离文件", role: .destructive) { store.delete(source.id) }
                     .font(.caption)
             }
