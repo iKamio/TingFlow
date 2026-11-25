@@ -365,7 +365,9 @@ final class EmbyClient {
             case 429: throw EmbyFailure.rateLimited
             default: throw EmbyFailure.http(http.statusCode)
             }
-            guard let mime = response.mimeType?.lowercased(), EmbyArtworkBody.types[mime] != nil else { throw EmbyFailure.response }
+            // Validate the declared wire type, not URLResponse's possible content sniffing.
+            guard let mime = http.value(forHTTPHeaderField: "Content-Type")?.components(separatedBy: ";").first?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                  EmbyArtworkBody.types[mime] != nil else { throw EmbyFailure.response }
             guard response.expectedContentLength <= Int64(EmbyArtworkBody.byteLimit) else { throw EmbyFailure.artworkLimit }
             var data = Data()
             for try await byte in bytes {

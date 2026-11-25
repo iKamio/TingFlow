@@ -287,7 +287,9 @@ final class SubsonicClient {
             case 403: throw SubsonicFailure.forbidden
             default: throw SubsonicFailure.network
             }
-            guard let mime = response.mimeType?.lowercased(), SubsonicArtworkBody.types[mime] != nil else { throw SubsonicFailure.response }
+            // Validate the declared wire type, not URLResponse's possible content sniffing.
+            guard let mime = http.value(forHTTPHeaderField: "Content-Type")?.components(separatedBy: ";").first?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                  SubsonicArtworkBody.types[mime] != nil else { throw SubsonicFailure.response }
             guard response.expectedContentLength <= Int64(SubsonicArtworkBody.byteLimit) else { throw SubsonicFailure.artworkLimit }
             var data = Data()
             for try await byte in bytes {
