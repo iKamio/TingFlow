@@ -111,7 +111,9 @@ private final class NeteaseRedirectBlocker: NSObject, URLSessionTaskDelegate {
             if endpoint == .playbackLog { header["os"] = "osx" }
             fields["header"] = header; fields["e_r"] = false
             body = NeteaseCrypto.form(try NeteaseCrypto.sealEAPI(apiPath: endpoint.rawValue, object: fields))
-            jar.merge(header) { _, value in value }
+            // The upstream EAPI contract sends the same allowlisted header as Cookie.
+            // Do not add unrelated remembered browser cookies to authenticated API requests.
+            jar = header
         } else {
             fields["csrf_token"] = jar["__csrf"] ?? ""; fields["e_r"] = false
             body = NeteaseCrypto.form(try NeteaseCrypto.seal(fields))

@@ -32,6 +32,23 @@ struct Song: Identifiable, Codable, Hashable {
     var losslessHash: String?
     var localFilename: String?
     var accountScope: String? = nil
+    // Derived presentation only: never persist an external URL or send server IDs/credentials.
+    var displayArtworkURL: URL? {
+        artworkURL ?? ((platform == .emby || platform == .subsonic) ? metadataURL("cover") : nil)
+    }
+    func metadataURL(_ path: String) -> URL? {
+        guard ["cover", "lyrics"].contains(path) else { return nil }
+        let name = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let singer = artist.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, !singer.isEmpty, name.utf8.count <= 512, singer.utf8.count <= 512,
+              !name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+              !singer.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else { return nil }
+        var components = URLComponents(string: "https://api.lrc.cx/" + path)!
+        components.queryItems = [URLQueryItem(name: "title", value: name), URLQueryItem(name: "artist", value: singer)]
+        // URLComponents leaves '+' literal; form-style query parsers interpret it as a space.
+        components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
+        return components.url
+    }
     var id: String {
         if let accountScope { return "\(platform.rawValue):\(accountScope):\(platformID)" }
         return "\(platform.rawValue):\(platformID)"

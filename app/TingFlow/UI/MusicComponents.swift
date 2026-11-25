@@ -50,7 +50,7 @@ struct TrackRowView: View {
         HStack(spacing: 12) {
             Button(action: play) {
                 HStack(spacing: 12) {
-                    ArtworkView(url: song.artworkURL, corner: 7).frame(width: 50, height: 50)
+                    ArtworkView(url: song.displayArtworkURL, corner: 7).frame(width: 50, height: 50)
                     VStack(alignment: .leading, spacing: 4) {
                         Text(song.title).foregroundStyle(.primary).lineLimit(1)
                         Text("\(song.artist) · \(song.platform.title)").font(.caption).foregroundStyle(.secondary).lineLimit(1)

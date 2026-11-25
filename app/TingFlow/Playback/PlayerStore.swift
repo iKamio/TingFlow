@@ -151,11 +151,11 @@ final class PlayerStore: ObservableObject {
         }
     }
     private func loadArtwork(for song: Song, token: UUID) {
-        guard let url = song.artworkURL, ArtworkLoader.isAllowed(url) else { return }
+        guard let url = song.displayArtworkURL, ArtworkLoader.isAllowed(url) else { return }
         let identity = NowPlayingArtworkIdentity(generation: token, songID: song.id, url: url)
         artworkTask = Task { [weak self] in
             defer {
-                if let self, identity.accepts(generation: self.generation, songID: self.current?.id, url: self.current?.artworkURL) {
+                if let self, identity.accepts(generation: self.generation, songID: self.current?.id, url: self.current?.displayArtworkURL) {
                     self.artworkTask = nil
                 }
             }
@@ -163,7 +163,7 @@ final class PlayerStore: ObservableObject {
                 let data = try await ArtworkLoader.shared.data(url)
                 try Task.checkCancellation()
                 guard let image = ArtworkLoader.thumbnail(data), !Task.isCancelled,
-                      let self, identity.accepts(generation: self.generation, songID: self.current?.id, url: self.current?.artworkURL) else { return }
+                      let self, identity.accepts(generation: self.generation, songID: self.current?.id, url: self.current?.displayArtworkURL) else { return }
                 // The system's synchronous callback owns only this bounded, immutable image.
                 self.artworkImage = image
                 self.artwork = (identity, MPMediaItemArtwork(boundsSize: image.size) { [image] _ in image })
@@ -295,7 +295,7 @@ final class PlayerStore: ObservableObject {
             MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
             MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.audio.rawValue
         ]
-        if let artwork, artwork.identity.belongsTo(songID: song.id, url: song.artworkURL) {
+        if let artwork, artwork.identity.belongsTo(songID: song.id, url: song.displayArtworkURL) {
             info[MPMediaItemPropertyArtwork] = artwork.value
         }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
@@ -340,7 +340,7 @@ final class PlayerStore: ObservableObject {
         queue = UIPolishFixture.songs; index = 0; current = queue[0]; elapsed = 25; duration = 246
         qualityLabel = "高品质 · MP3 · 320 kbps"; sourceLabel = "原生界面测试数据"; artworkImage = UIPolishFixture.image(UIPolishFixture.url("a"))
         if let image = artworkImage, let song = current {
-            let identity = NowPlayingArtworkIdentity(generation: generation, songID: song.id, url: song.artworkURL!)
+            let identity = NowPlayingArtworkIdentity(generation: generation, songID: song.id, url: song.displayArtworkURL!)
             artwork = (identity, MPMediaItemArtwork(boundsSize: image.size) { [image] _ in image })
         }
         publishMetadata()

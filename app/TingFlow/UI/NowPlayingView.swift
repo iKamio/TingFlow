@@ -26,7 +26,7 @@ private struct MiniPlayerContent: View {
         HStack(spacing: compact ? 5 : 10) {
             Button(action: open) {
                 HStack(spacing: 9) {
-                    ArtworkView(url: player.current?.artworkURL, corner: compact ? 5 : 7)
+                    ArtworkView(url: player.current?.displayArtworkURL, corner: compact ? 5 : 7)
                         .frame(width: compact ? 28 : 38, height: compact ? 28 : 38)
                     VStack(alignment: .leading, spacing: 1) {
                         Text(player.current?.title ?? "听流").font(.subheadline.weight(.semibold)).lineLimit(1)
@@ -80,6 +80,10 @@ struct NowPlayingView: View {
     @State private var panel = Panel.artwork
     @State private var lyrics: [LyricLine] = []
     @State private var lyricMessage = ""
+    @State private var lyricPlainText = ""
+    @State private var lyricSource = ""
+    @State private var lyricRetry = 0
+    @State private var lyricGeneration = UUID()
     @State private var scrub: Double = 0
     @State private var scrubbing = false
     var body: some View {
@@ -99,7 +103,7 @@ struct NowPlayingView: View {
             }
         }
         .tint(.primary)
-        .task(id: player.current?.id) { await loadLyrics() }
+        .task(id: "\(player.current?.id ?? ""):\(lyricRetry)") { await loadLyrics() }
         .onChange(of: player.current?.id) { _ in scrubbing = false }
     }
     /// Restrict pull-to-close to the header/cover, never lyric/queue scroll views or sliders.
@@ -152,7 +156,7 @@ struct NowPlayingView: View {
         VStack(spacing: 16) {
             if panel == .artwork {
                 Spacer(minLength: 0)
-                ArtworkView(url: player.current?.artworkURL, corner: 16)
+                ArtworkView(url: player.current?.displayArtworkURL, corner: 16)
                     .aspectRatio(1, contentMode: .fit).frame(maxWidth: min(410, max(180, height - 100)))
                     .shadow(color: .black.opacity(scheme == .dark ? 0.30 : 0.12), radius: 22, y: 12)
                     .scaleEffect(player.isPlaying ? 1 : 0.93)
@@ -170,7 +174,7 @@ struct NowPlayingView: View {
     }
     private func trackHeading(compact: Bool) -> some View {
         HStack(spacing: 12) {
-            if compact { ArtworkView(url: player.current?.artworkURL, corner: 7).frame(width: 48, height: 48) }
+            if compact { ArtworkView(url: player.current?.displayArtworkURL, corner: 7).frame(width: 48, height: 48) }
             VStack(alignment: .leading, spacing: 5) {
                 Text(player.current?.title ?? "尚未播放").font(compact ? .headline : .title2.weight(.bold)).lineLimit(2)
                 Text(player.current?.artist ?? "").font(compact ? .subheadline : .title3).foregroundStyle(.secondary).lineLimit(1)
@@ -261,9 +265,18 @@ struct NowPlayingView: View {
     private var lyricPanel: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                if lyrics.isEmpty {
-                    Text(lyricMessage.isEmpty ? "此来源暂无歌词" : lyricMessage).font(.title3)
-                        .foregroundStyle(.secondary).frame(maxWidth: .infinity).padding(.top, 80)
+                if !lyricSource.isEmpty {
+                    Text(lyricSource).font(.caption).foregroundStyle(.secondary).padding(.top, 12)
+                }
+                if !lyricPlainText.isEmpty {
+                    Text(lyricPlainText).font(.title3).frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 26)
+                } else if lyrics.isEmpty {
+                    VStack(spacing: 18) {
+                        Text(lyricMessage.isEmpty ? "此来源暂无歌词" : lyricMessage).font(.title3).foregroundStyle(.secondary)
+                        if !lyricMessage.contains("正在读取"), player.current != nil {
+                            Button("重试歌词") { lyricRetry += 1 }.accessibilityIdentifier("lyrics-retry")
+                        }
+                    }.frame(maxWidth: .infinity).padding(.top, 65)
                 } else {
                     LazyVStack(alignment: .leading, spacing: 26) {
                         ForEach(lyrics) { line in
@@ -300,7 +313,7 @@ struct NowPlayingView: View {
                         ForEach(Array(player.queue.enumerated()), id: \.offset) { index, song in
                             Button { player.play(player.queue, at: index) } label: {
                                 HStack(spacing: 10) {
-                                    ArtworkView(url: song.artworkURL, corner: 6).frame(width: 40, height: 40)
+                                    ArtworkView(url: song.displayArtworkURL, corner: 6).frame(width: 40, height: 40)
                                     VStack(alignment: .leading, spacing: 3) {
                                         Text(song.title).font(.subheadline.weight(index == player.index ? .semibold : .regular)).lineLimit(1)
                                         Text(song.artist).font(.caption).foregroundStyle(.secondary).lineLimit(1)
@@ -316,22 +329,34 @@ struct NowPlayingView: View {
         }
     }
     private func loadLyrics() async {
-        lyrics = []; lyricMessage = ""
+        let token = UUID(); lyricGeneration = token
+        lyrics = []; lyricMessage = ""; lyricPlainText = ""; lyricSource = ""
         #if DEBUG
         if UIPolishFixture.enabled {
             lyrics = LRCParser.parse("[00:00]沿着海岸慢慢走\n[00:12]听风把故事带走\n[00:25]这一刻只想听见音乐\n[00:40]原生界面测试歌词")
             return
         }
         #endif
-        guard let song = player.current, song.platform == .netease else { return }
+        guard let song = player.current else { return }
+        guard [.netease, .emby, .subsonic].contains(song.platform) else {
+            lyricMessage = "此来源尚未提供歌词。"; return
+        }
         lyricMessage = "正在读取歌词…"
         do {
-            let text = try await netease.lyrics(for: song)
+            let text: String
+            if song.platform == .netease { text = try await netease.lyrics(for: song) }
+            else { text = try await ExternalMetadata.shared.lyrics(for: song) }
             try Task.checkCancellation()
-            guard player.current?.id == song.id else { return }
-            lyrics = LRCParser.parse(text); lyricMessage = lyrics.isEmpty ? "暂无同步歌词" : ""
+            guard player.current?.id == song.id, lyricGeneration == token else { return }
+            lyrics = LRCParser.parse(text)
+            if lyrics.isEmpty { lyricPlainText = text.trimmingCharacters(in: .whitespacesAndNewlines) }
+            lyricSource = song.platform == .netease ? "网易云歌词" : "外部歌词 · api.lrc.cx · 按歌名与歌手匹配，版本可能不同"
+            lyricMessage = lyrics.isEmpty && lyricPlainText.isEmpty ? "暂无可用歌词。" : ""
         } catch is CancellationError { }
-        catch { if !Task.isCancelled { lyricMessage = "歌词暂时不可用" } }
+        catch {
+            guard !Task.isCancelled, player.current?.id == song.id, lyricGeneration == token else { return }
+            lyricMessage = (error as? ExternalMetadataFailure)?.localizedDescription ?? "歌词暂时不可用，请重试。"
+        }
     }
     private func time(_ value: Double) -> String {
         guard value.isFinite, value >= 0 else { return "0:00" }

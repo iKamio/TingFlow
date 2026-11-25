@@ -21,7 +21,7 @@ enum NeteaseWire {
                       "os": "pc", "appver": "3.1.17.204416", "versioncode": "140", "mobilename": "",
                       "buildver": String(Int(now)), "resolution": "1920x1080", "channel": "netease",
                       "requestId": String(format: "%lld_%04d", Int64(now * 1000), Int(now * 1_000_000) % 1000), "__csrf": csrf]
-        for name in ["MUSIC_U", "NMTID"] { if let value = cookies[name] { result[name] = value } }
+        for name in ["MUSIC_U", "MUSIC_A", "NMTID"] { if let value = cookies[name] { result[name] = value } }
         return result
     }
     static func validate(code: Int, endpoint: NeteaseClient.Endpoint) throws {

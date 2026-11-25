@@ -53,3 +53,5 @@ xcrun swiftc -swift-version 5 app/TingFlow/Netease/NeteasePlaylistLoadController
 "$TMP/playlist-load-checks"
 xcrun swiftc -swift-version 5 "${CORE[@]}" "${NCM[@]}" app/TingFlow/Netease/NeteaseQRWindow.swift app/TingFlow/Netease/NeteaseStore.swift tests/NeteaseFlowFixture.swift tests/NeteasePlaylistTransportChecks.swift -o "$TMP/playlist-transport-checks"
 "$TMP/playlist-transport-checks"
+xcrun swiftc -swift-version 5 app/TingFlow/Core/Models.swift app/TingFlow/Services/ExternalMetadata.swift tests/ExternalMetadataChecks.swift -o "$TMP/external-metadata-checks"
+"$TMP/external-metadata-checks"

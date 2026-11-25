@@ -19,6 +19,7 @@ struct ContentView: View {
     @State private var neteaseScope: String?
     @State private var subsonicScope: String?
     @State private var playbackNotice: String?
+    @State private var showPlaybackSettings = false
 
     var body: some View {
         tabs
@@ -101,8 +102,22 @@ struct ContentView: View {
             .onChange(of: netease.syncPlaybackHistory) { value in player.reportsListening = value }
             .onChange(of: player.errorMessage) { value in playbackNotice = value }
             .alert("无法播放", isPresented: Binding(get: { playbackNotice != nil }, set: { if !$0 { playbackNotice = nil } })) {
+                if player.current?.platform == .netease {
+                    Button("播放设置与诊断") { playbackNotice = nil; showPlaybackSettings = true }
+                }
                 Button("知道了", role: .cancel) { playbackNotice = nil }
             } message: { Text(playbackNotice ?? "") }
+            .sheet(isPresented: $showPlaybackSettings) {
+                NavigationStack {
+                    PlaybackSettingsView(preferences: preferences)
+                        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { showPlaybackSettings = false } } }
+                        .safeAreaInset(edge: .bottom) {
+                            if let diagnostic = netease.playbackDiagnostic {
+                                ScrollView { Text(diagnostic).font(.caption.monospaced()).textSelection(.enabled).padding() }.frame(maxHeight: 180)
+                            }
+                        }
+                }
+            }
             .onChange(of: emby.scopeID) { value in
                 clearScope(embyScope, new: value, platform: .emby); embyScope = value
             }

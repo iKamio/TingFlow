@@ -125,9 +125,12 @@ struct EmbyLibraryView: View {
 private struct EmbySongRow: View {
     let song: Song
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(song.title).foregroundStyle(.primary)
-            Text(song.artist.isEmpty ? song.album : song.artist).font(.caption).foregroundStyle(.secondary)
+        HStack(spacing: 12) {
+            ArtworkView(url: song.displayArtworkURL, corner: 7).frame(width: 50, height: 50)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(song.title).foregroundStyle(.primary).lineLimit(1)
+                Text(song.artist.isEmpty ? song.album : song.artist).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
         }
     }
 }

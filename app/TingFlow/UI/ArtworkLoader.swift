@@ -20,13 +20,23 @@ actor ArtworkLoader {
         c.httpCookieStorage = nil; c.httpShouldSetCookies = false
         c.urlCredentialStorage = nil; c.urlCache = nil
         c.timeoutIntervalForRequest = 15; c.timeoutIntervalForResource = 25
+        c.httpMaximumConnectionsPerHost = 4
         session = URLSession(configuration: c, delegate: ArtworkRedirects(), delegateQueue: nil)
     }
     nonisolated static func isAllowed(_ url: URL) -> Bool {
         guard url.scheme == "https", url.user == nil, url.password == nil,
-              url.query == nil, url.fragment == nil, url.port == nil || url.port == 443,
+              url.fragment == nil, url.port == nil || url.port == 443,
               let host = url.host?.lowercased() else { return false }
-        return ["music.163.com", "music.126.net", "kugou.com"].contains { host == $0 || host.hasSuffix("." + $0) }
+        if host == "api.lrc.cx" {
+            guard url.path == "/cover", let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems,
+                  items.count == 2, Set(items.map(\.name)) == ["title", "artist"] else { return false }
+            return items.allSatisfy { item in
+                guard let value = item.value else { return false }
+                return !value.isEmpty && value.utf8.count <= 512 && !value.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) }
+            }
+        }
+        guard url.query == nil else { return false }
+        return ["music.163.com", "music.126.net", "kugou.com", "mzstatic.com"].contains { host == $0 || host.hasSuffix("." + $0) }
     }
     func data(_ url: URL) async throws -> Data {
         guard Self.isAllowed(url) else { throw MusicError.invalidURL }
