@@ -29,6 +29,14 @@ final class SourceImportLifecycleUITests: XCTestCase {
         app.alerts.buttons["知道了"].tap()
         XCTAssertTrue(app.staticTexts["Import-Lifecycle-Only"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.staticTexts["已隔离 · 尚未信任"].exists, "import must not initialize or run a source")
+        let trust = app.buttons["审阅脚本并授权域名"].firstMatch
+        XCTAssertTrue(trust.waitForExistence(timeout: 5)); trust.tap()
+        XCTAssertTrue(app.navigationBars["审阅并授权"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.navigationBars["原始脚本"].exists, "trust must not simultaneously navigate the row's code link")
+        let cancelTrust = app.navigationBars["审阅并授权"].buttons["取消"]
+        XCTAssertTrue(cancelTrust.exists); cancelTrust.tap()
+        XCTAssertTrue(app.navigationBars["自定义音源"].waitForExistence(timeout: 8))
+        XCTAssertTrue(app.staticTexts["已隔离 · 尚未信任"].exists, "cancelling trust cannot authorize or run a source")
         let back = app.navigationBars["自定义音源"].buttons.element(boundBy: 0)
         XCTAssertTrue(back.exists); back.tap()
         XCTAssertTrue(app.navigationBars["账号与设置"].waitForExistence(timeout: 8))

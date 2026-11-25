@@ -206,6 +206,10 @@ private enum SourceManagerModal: Identifiable {
                     .font(.caption)
             }
         }.padding(.vertical, 5)
+        // Several independent controls share this List cell. Automatic row
+        // button handling can also activate its read-only NavigationLink when
+        // the trust button is tapped. Keep every action local to its label.
+        .buttonStyle(.borderless)
     }
 }
 
