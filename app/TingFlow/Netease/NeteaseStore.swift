@@ -54,6 +54,7 @@ import Combine
     var currentUserID: String? { isSignedIn ? userID : nil }
     private var restorationDisabled = false
     private var generation = UUID()
+    private var playbackTicket = UUID()
     private var qrGeneration = UUID()
     private var qrPollingID = UUID()
     private var qrWindow: NeteaseQRWindow?
@@ -419,9 +420,14 @@ import Combine
         return (client, generation)
     }
     func playback(for song: Song, quality: AudioQuality = .high, mode: NeteasePlaybackMode = .nativeV1) async throws -> PlaybackResource {
+        let ticket = UUID(); playbackTicket = ticket
         playbackDiagnostic = nil
         let (client, token) = try context(for: song)
-        defer { if generation == token { playbackDiagnostic = client.playbackDiagnostic?.text } }
+        defer {
+            if generation == token && playbackTicket == ticket && !Task.isCancelled {
+                playbackDiagnostic = client.playbackDiagnostic?.text
+            }
+        }
         do {
             let body: [String: Any]
             switch mode {
@@ -438,10 +444,8 @@ import Combine
             return resource
         } catch NeteaseError.verification {
             try ensureCurrent(token)
-            let diagnostic = client.playbackDiagnostic
-            if let code = ([diagnostic?.businessCode].compactMap { $0 } + (diagnostic?.mediaCodes ?? [])).first(where: { [-460, -462, 405].contains($0) }) {
-                throw NeteaseError.playbackVerification(code)
-            }
+            // Request-specific numeric refusals already travel as playbackVerification.
+            // Never infer this request's error from another playback's shared diagnostic.
             throw NeteaseError.verification
         }
     }

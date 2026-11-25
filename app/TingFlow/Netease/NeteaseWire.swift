@@ -4,7 +4,13 @@ import Foundation
 enum NeteaseWire {
     static let webHost = "music.163.com"
     static let interfaceHost = "interface.music.163.com"
+    static let xeapiHost = "interface3.music.163.com"
+    static let xeapiKeyURL = URL(string: "https://interface.music.163.com/api/bsr/sk/get")!
     static func url(_ endpoint: NeteaseClient.Endpoint) throws -> URL {
+        if endpoint.usesXEAPI {
+            guard endpoint == .playbackV1 else { throw NeteaseError.unsafeURL }
+            return URL(string: "https://\(xeapiHost)/xeapi/song/enhance/player/url/v1")!
+        }
         let suffix = String(endpoint.rawValue.dropFirst(4))
         let host = endpoint.usesEAPI ? interfaceHost : webHost
         let prefix = endpoint.usesPlainWebAPI ? "/api" : (endpoint.usesEAPI ? "/eapi" : "/weapi")
@@ -12,7 +18,9 @@ enum NeteaseWire {
         return url
     }
     static func isAPIURL(_ url: URL) -> Bool {
-        url.scheme?.lowercased() == "https" && [webHost, interfaceHost].contains(url.host?.lowercased() ?? "") &&
+        url.scheme?.lowercased() == "https" &&
+            ([webHost, interfaceHost].contains(url.host?.lowercased() ?? "") ||
+             (url.host?.lowercased() == xeapiHost && url.path == "/xeapi/song/enhance/player/url/v1")) &&
             url.user == nil && url.password == nil && url.fragment == nil && (url.port == nil || url.port == 443)
     }
     static func header(device: String, csrf: String, cookies: [String: String], date: Date = Date()) -> [String: String] {
@@ -28,7 +36,10 @@ enum NeteaseWire {
         if endpoint == .qrCheck, [800, 801, 802, 803].contains(code) { return }
         if code == 200 { return }
         if code == 301 || code == 302 { throw NeteaseError.signedOut }
-        if code == -460 || code == -462 || code == 405 { throw NeteaseError.verification }
+        if code == -460 || code == -462 || code == 405 {
+            if endpoint == .playback || endpoint == .playbackV1 { throw NeteaseError.playbackVerification(code) }
+            throw NeteaseError.verification
+        }
         if code == 429 { throw NeteaseError.rateLimited }
         // Never show the raw message/body: it can contain URLs and account details.
         throw NeteaseError.business(code)

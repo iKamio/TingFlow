@@ -31,7 +31,7 @@ assert.equal(rsa, independentRSA);
 const params = aes(aes('{}', '0CoJUm6Qyw8W8jud'), secret);
 const checks = fs.existsSync(path.join(__dirname, 'NeteaseChecks.swift')) ? fs.readFileSync(path.join(__dirname, 'NeteaseChecks.swift'), 'utf8') : '';
 if (checks) { assert.ok(checks.includes(params)); assert.ok(checks.includes(rsa)); }
-for (const name of ['NeteaseClient.swift', 'NeteaseStore.swift', 'NeteaseCrypto.swift']) {
+for (const name of ['NeteaseClient.swift', 'NeteaseStore.swift', 'NeteaseCrypto.swift', 'NeteaseXEAPI.swift', 'NeteaseXEAPISession.swift']) {
   const source = fs.readFileSync(path.join(root, name), 'utf8');
   assert.ok(!/\b(?:print|debugPrint|NSLog)\s*\(/.test(source), 'no credential/body logging');
   assert.ok(!/URLSession\.shared|URLSessionConfiguration\.default/.test(source), 'no shared sessions');

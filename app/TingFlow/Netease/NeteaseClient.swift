@@ -32,16 +32,19 @@ private final class NeteaseRedirectBlocker: NSObject, URLSessionTaskDelegate {
         case manipulatePlaylistTracks = "/api/playlist/manipulate/tracks"
         case recentSongs = "/api/play-record/song/list"
         case playbackLog = "/api/feedback/weblog"
-        var usesEAPI: Bool { !usesPlainWebAPI && self != .lyric && self != .playback }
+        var usesXEAPI: Bool { self == .playbackV1 }
+        var usesEAPI: Bool { !usesPlainWebAPI && !usesXEAPI && self != .lyric && self != .playback }
         var usesPlainWebAPI: Bool { self == .captchaSent || self == .phoneLogin }
     }
     private struct Cookie: Codable { let name: String; let value: String; let expires: Date? }
     private struct Credential: Codable { let version: Int; let userID: String; let cookies: [Cookie] }
     private static let cookieNames: Set<String> = ["MUSIC_U", "MUSIC_A", "__csrf", "NMTID", "__remember_me", "WNMCID", "WEVNSM"]
     private let session: URLSession
+    private let xeapi: NeteaseXEAPISession
     private let device: String
     private var cookies: [String: Cookie] = [:]
     private var invalidated = false
+    private var playbackTicket = UUID()
     private(set) var restoredUserID: String?
     private(set) var playbackDiagnostic: NeteasePlaybackDiagnostic?
     init(configuration: URLSessionConfiguration? = nil, deviceID: String? = nil) {
@@ -52,7 +55,9 @@ private final class NeteaseRedirectBlocker: NSObject, URLSessionTaskDelegate {
         config.timeoutIntervalForRequest = 20; config.timeoutIntervalForResource = 30
         config.waitsForConnectivity = false
         session = URLSession(configuration: config, delegate: NeteaseRedirectBlocker(), delegateQueue: nil)
-        device = deviceID ?? Self.installationID()
+        let installation = deviceID ?? Self.installationID()
+        device = installation
+        xeapi = NeteaseXEAPISession(configuration: config, device: installation)
     }
     convenience init(credentialData: Data) throws {
         self.init()
@@ -68,11 +73,23 @@ private final class NeteaseRedirectBlocker: NSObject, URLSessionTaskDelegate {
         restoredUserID = uid
     }
     deinit { session.invalidateAndCancel() }
-    func invalidate() { invalidated = true; cookies.removeAll(); restoredUserID = nil; playbackDiagnostic = nil; session.invalidateAndCancel() }
+    func invalidate() { invalidated = true; cookies.removeAll(); restoredUserID = nil; playbackDiagnostic = nil; xeapi.invalidate(); session.invalidateAndCancel() }
     private static func valid(_ cookie: Cookie) -> Bool {
         cookieNames.contains(cookie.name) && !cookie.value.isEmpty && cookie.value.utf8.count < 32768 &&
         cookie.value.utf8.allSatisfy { $0 >= 0x21 && $0 <= 0x7e && ![34,44,59,92].contains($0) } &&
         (cookie.expires == nil || cookie.expires! > Date())
+    }
+    private func absorbResponseCookies(_ http: HTTPURLResponse, url: URL) {
+        guard !invalidated, http.url == url, NeteaseWire.isAPIURL(url),
+              let host = url.host?.lowercased() else { return }
+        for parsed in NeteaseWire.responseCookies(http, url: url) {
+            let domain = parsed.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            guard ["music.163.com", "interface.music.163.com", "interface3.music.163.com"].contains(domain),
+                  host == domain || host.hasSuffix("." + domain),
+                  parsed.path == "/", Self.cookieNames.contains(parsed.name) else { continue }
+            let value = Cookie(name: parsed.name, value: parsed.value, expires: parsed.expiresDate)
+            if Self.valid(value) { cookies[value.name] = value } else { cookies.removeValue(forKey: value.name) }
+        }
     }
     func credentialData(userID: String) throws -> Data {
         guard !invalidated, cookies["MUSIC_U"].map(Self.valid) == true else { throw NeteaseError.signedOut }
@@ -95,8 +112,25 @@ private final class NeteaseRedirectBlocker: NSObject, URLSessionTaskDelegate {
         try Task.checkCancellation()
         guard !invalidated else { throw CancellationError() }
         cookies = cookies.filter { Self.valid($0.value) }
-        if endpoint == .playback || endpoint == .playbackV1 {
-            playbackDiagnostic = NeteasePlaybackDiagnostic(v1: endpoint == .playbackV1, level: payload["level"] as? String)
+        let isPlayback = endpoint == .playback || endpoint == .playbackV1
+        let ticket = UUID()
+        var diagnostic: NeteasePlaybackDiagnostic?
+        if isPlayback {
+            playbackTicket = ticket
+            diagnostic = NeteasePlaybackDiagnostic(v1: endpoint == .playbackV1, level: payload["level"] as? String)
+            playbackDiagnostic = diagnostic
+        }
+        defer {
+            if isPlayback && !invalidated && !Task.isCancelled && playbackTicket == ticket {
+                playbackDiagnostic = diagnostic
+            }
+        }
+        if endpoint.usesXEAPI {
+            let result = try await xeapi.playback(payload, cookies: cookies.mapValues(\.value)) { diagnostic = $0 }
+            try Task.checkCancellation()
+            guard !invalidated else { throw CancellationError() }
+            absorbResponseCookies(result.response, url: try NeteaseWire.url(endpoint))
+            return result.object
         }
         let url = try NeteaseWire.url(endpoint)
         var jar = cookies.mapValues(\.value), fields = payload
@@ -132,7 +166,7 @@ private final class NeteaseRedirectBlocker: NSObject, URLSessionTaskDelegate {
             try Task.checkCancellation()
             guard !invalidated else { throw CancellationError() }
             guard let http = response as? HTTPURLResponse, http.url == url else { throw NeteaseError.unsafeURL }
-            if endpoint == .playback || endpoint == .playbackV1 { playbackDiagnostic?.httpStatus = http.statusCode }
+            if endpoint == .playback || endpoint == .playbackV1 { diagnostic?.httpStatus = http.statusCode }
             guard (200..<300).contains(http.statusCode) else {
                 if http.statusCode == 401 { throw NeteaseError.signedOut }
                 if http.statusCode == 429 { throw NeteaseError.rateLimited }
@@ -149,17 +183,11 @@ private final class NeteaseRedirectBlocker: NSObject, URLSessionTaskDelegate {
             guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let code = object["code"] as? Int else { throw NeteaseError.response }
             if endpoint == .playback || endpoint == .playbackV1 {
-                playbackDiagnostic?.businessCode = code
-                playbackDiagnostic?.mediaCodes = Array((object["data"] as? [[String: Any]] ?? []).prefix(8).compactMap { $0["code"] as? Int })
+                diagnostic?.businessCode = code
+                diagnostic?.mediaCodes = Array((object["data"] as? [[String: Any]] ?? []).prefix(8).compactMap { $0["code"] as? Int })
             }
             try NeteaseWire.validate(code: code, endpoint: endpoint)
-            for parsed in NeteaseWire.responseCookies(http, url: url) {
-                let domain = parsed.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
-                guard ["music.163.com", "interface.music.163.com"].contains(domain),
-                      parsed.path == "/", Self.cookieNames.contains(parsed.name) else { continue }
-                let value = Cookie(name: parsed.name, value: parsed.value, expires: parsed.expiresDate)
-                if Self.valid(value) { cookies[value.name] = value } else { cookies.removeValue(forKey: value.name) }
-            }
+            absorbResponseCookies(http, url: url)
             return object
         } catch is CancellationError { throw CancellationError() }
         catch let error as NeteaseError { throw error }

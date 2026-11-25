@@ -1,19 +1,24 @@
 #!/bin/bash
 set -euo pipefail
 CORE=(app/TingFlow/Core/Models.swift app/TingFlow/Core/PlaybackResource.swift app/TingFlow/Playback/ListeningSession.swift)
-NCM=(app/TingFlow/Netease/NeteaseModels.swift app/TingFlow/Netease/NeteaseAudioPolicy.swift app/TingFlow/Netease/NeteasePlaybackDiagnostic.swift app/TingFlow/Netease/NeteaseCloudPolicy.swift app/TingFlow/Netease/NeteaseHistoryPolicy.swift app/TingFlow/Netease/NeteaseCrypto.swift app/TingFlow/Netease/NeteaseWire.swift app/TingFlow/Netease/NeteaseClient.swift)
+NCM=(app/TingFlow/Netease/NeteaseModels.swift app/TingFlow/Netease/NeteaseAudioPolicy.swift app/TingFlow/Netease/NeteasePlaybackDiagnostic.swift app/TingFlow/Netease/NeteaseCloudPolicy.swift app/TingFlow/Netease/NeteaseHistoryPolicy.swift app/TingFlow/Netease/NeteaseCrypto.swift app/TingFlow/Netease/NeteaseXEAPI.swift app/TingFlow/Netease/NeteaseXEAPISession.swift app/TingFlow/Netease/NeteaseWire.swift app/TingFlow/Netease/NeteaseClient.swift)
 EMBY=(app/TingFlow/Emby/EmbyClient.swift app/TingFlow/Emby/EmbyPaging.swift app/TingFlow/Emby/EmbyPlaybackDiagnostic.swift app/TingFlow/Emby/EmbyStore.swift)
 SOURCES=(app/TingFlow/Sources/SourceModels.swift app/TingFlow/Sources/SourceHTTP.swift app/TingFlow/Sources/SourceRuntime.swift app/TingFlow/Sources/SourceStore.swift)
 TMP=${RUNNER_TEMP:-/tmp}
 node --check app/TingFlow/Sources/SourceBootstrap.js
 node tests/NeteaseVectors.js
+node tests/NeteaseXEAPIVectors.js --check
+xcrun swiftc -swift-version 5 app/TingFlow/Netease/NeteaseXEAPI.swift tests/NeteaseXEAPIChecks.swift -lz -o "$TMP/netease-xeapi-checks"
+"$TMP/netease-xeapi-checks"
+xcrun swiftc -swift-version 5 "${CORE[@]}" "${NCM[@]}" -lz tests/NeteaseXEAPIServerFixture.swift tests/NeteaseXEAPITransportChecks.swift -o "$TMP/netease-xeapi-transport-checks"
+"$TMP/netease-xeapi-transport-checks"
 cat app/TingFlow/Core/Models.swift tests/ModelChecks.swift > "$TMP/TingFlowModelChecks.swift"
 swift "$TMP/TingFlowModelChecks.swift"
 cat app/TingFlow/Playback/PlaybackPolicy.swift tests/PlaybackChecks.swift > "$TMP/TingFlowPlaybackChecks.swift"
 swift "$TMP/TingFlowPlaybackChecks.swift"
-xcrun swiftc -swift-version 5 "${CORE[@]}" "${NCM[@]}" tests/NeteaseChecks.swift -o "$TMP/netease-checks"
+xcrun swiftc -swift-version 5 "${CORE[@]}" "${NCM[@]}" -lz tests/NeteaseChecks.swift -o "$TMP/netease-checks"
 "$TMP/netease-checks"
-xcrun swiftc -swift-version 5 "${CORE[@]}" "${NCM[@]}" app/TingFlow/Netease/NeteaseQRWindow.swift app/TingFlow/Netease/NeteaseStore.swift tests/NeteaseFlowFixture.swift tests/NeteaseFlowChecks.swift -o "$TMP/netease-flow-checks"
+xcrun swiftc -swift-version 5 "${CORE[@]}" "${NCM[@]}" -lz app/TingFlow/Netease/NeteaseQRWindow.swift app/TingFlow/Netease/NeteaseStore.swift tests/NeteaseFlowFixture.swift tests/NeteaseFlowChecks.swift -o "$TMP/netease-flow-checks"
 "$TMP/netease-flow-checks"
 cat "${CORE[@]}" app/TingFlow/Emby/EmbyClient.swift tests/EmbyChecks.swift > "$TMP/TingFlowEmbyChecks.swift"
 swift "$TMP/TingFlowEmbyChecks.swift"
@@ -33,7 +38,7 @@ xcrun swiftc -swift-version 5 "${CORE[@]}" app/TingFlow/Subsonic/SubsonicClient.
 "$TMP/subsonic-flow-checks"
 xcrun swiftc -swift-version 5 app/TingFlow/Updates/UpdatePolicy.swift tests/UpdateChecks.swift -o "$TMP/update-checks"
 "$TMP/update-checks"
-xcrun swiftc -swift-version 5 "${CORE[@]}" "${NCM[@]}" app/TingFlow/Netease/NeteaseQRWindow.swift app/TingFlow/Netease/NeteaseStore.swift tests/NeteaseFlowFixture.swift tests/NeteaseQualityFixture.swift tests/NeteaseQualityChecks.swift -o "$TMP/netease-quality-checks"
+xcrun swiftc -swift-version 5 "${CORE[@]}" "${NCM[@]}" -lz app/TingFlow/Netease/NeteaseQRWindow.swift app/TingFlow/Netease/NeteaseStore.swift tests/NeteaseFlowFixture.swift tests/NeteaseXEAPIServerFixture.swift tests/NeteaseQualityFixture.swift tests/NeteaseQualityChecks.swift -o "$TMP/netease-quality-checks"
 "$TMP/netease-quality-checks"
 xcrun swiftc -swift-version 5 app/TingFlow/Playback/NowPlayingArtworkPolicy.swift tests/NowPlayingArtworkChecks.swift -o "$TMP/now-playing-artwork-checks"
 "$TMP/now-playing-artwork-checks"
@@ -41,17 +46,17 @@ xcrun swiftc -swift-version 5 app/TingFlow/Core/Models.swift app/TingFlow/Source
 "$TMP/source-match-checks"
 xcrun swiftc -swift-version 5 "${CORE[@]}" "${SOURCES[@]}" app/TingFlow/Sources/SourceFileImport.swift tests/SourceFileImportChecks.swift -o "$TMP/source-file-import-checks"
 "$TMP/source-file-import-checks"
-xcrun swiftc -swift-version 5 "${CORE[@]}" "${NCM[@]}" app/TingFlow/Netease/NeteaseQRWindow.swift app/TingFlow/Netease/NeteaseStore.swift tests/NeteaseCloudFixture.swift tests/NeteaseCloudChecks.swift -o "$TMP/netease-cloud-checks"
+xcrun swiftc -swift-version 5 "${CORE[@]}" "${NCM[@]}" -lz app/TingFlow/Netease/NeteaseQRWindow.swift app/TingFlow/Netease/NeteaseStore.swift tests/NeteaseCloudFixture.swift tests/NeteaseCloudChecks.swift -o "$TMP/netease-cloud-checks"
 "$TMP/netease-cloud-checks"
 xcrun swiftc -swift-version 5 app/TingFlow/Core/Models.swift app/TingFlow/Playback/ListeningSession.swift tests/ListeningSessionChecks.swift -o "$TMP/listening-checks"
 "$TMP/listening-checks"
-xcrun swiftc -swift-version 5 "${CORE[@]}" "${NCM[@]}" tests/NeteaseHistoryPolicyChecks.swift -o "$TMP/netease-history-policy-checks"
+xcrun swiftc -swift-version 5 "${CORE[@]}" "${NCM[@]}" -lz tests/NeteaseHistoryPolicyChecks.swift -o "$TMP/netease-history-policy-checks"
 "$TMP/netease-history-policy-checks"
-xcrun swiftc -swift-version 5 "${CORE[@]}" "${NCM[@]}" app/TingFlow/Netease/NeteaseQRWindow.swift app/TingFlow/Netease/NeteaseStore.swift tests/NeteaseCloudFixture.swift tests/NeteaseHistoryFlowChecks.swift -o "$TMP/netease-history-flow-checks"
+xcrun swiftc -swift-version 5 "${CORE[@]}" "${NCM[@]}" -lz app/TingFlow/Netease/NeteaseQRWindow.swift app/TingFlow/Netease/NeteaseStore.swift tests/NeteaseCloudFixture.swift tests/NeteaseHistoryFlowChecks.swift -o "$TMP/netease-history-flow-checks"
 "$TMP/netease-history-flow-checks"
 xcrun swiftc -swift-version 5 app/TingFlow/Netease/NeteasePlaylistLoadController.swift tests/NeteasePlaylistLoadChecks.swift -o "$TMP/playlist-load-checks"
 "$TMP/playlist-load-checks"
-xcrun swiftc -swift-version 5 "${CORE[@]}" "${NCM[@]}" app/TingFlow/Netease/NeteaseQRWindow.swift app/TingFlow/Netease/NeteaseStore.swift tests/NeteaseFlowFixture.swift tests/NeteasePlaylistTransportChecks.swift -o "$TMP/playlist-transport-checks"
+xcrun swiftc -swift-version 5 "${CORE[@]}" "${NCM[@]}" -lz app/TingFlow/Netease/NeteaseQRWindow.swift app/TingFlow/Netease/NeteaseStore.swift tests/NeteaseFlowFixture.swift tests/NeteasePlaylistTransportChecks.swift -o "$TMP/playlist-transport-checks"
 "$TMP/playlist-transport-checks"
 xcrun swiftc -swift-version 5 app/TingFlow/Core/Models.swift app/TingFlow/Services/ExternalMetadata.swift tests/ExternalMetadataChecks.swift -o "$TMP/external-metadata-checks"
 "$TMP/external-metadata-checks"

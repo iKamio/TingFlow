@@ -19,16 +19,19 @@ import Foundation
         let song = Song(platform: .netease, platformID: "1", title: "Fixture", artist: "", album: "", duration: 1, accountScope: "netease:7")
         let row: [String: Any] = ["id": 1, "code": 200, "url": "https://m1.music.126.net/fixture.mp3?signature=synthetic", "type": "mp3", "br": 128000, "level": "standard", "freeTrialInfo": NSNull(), "fee": 1, "pl": 128000]
         let original = try JSONSerialization.data(withJSONObject: row, options: .sortedKeys)
+        NeteaseXEAPIServerFixture.reset()
         for quality in AudioQuality.allCases {
             NeteaseQualityFixture.configure([.row(row)])
             let resource = try await store.playback(for: song, quality: quality)
             let requests = NeteaseQualityFixture.requests()
-            expect(requests.count == 1 && requests[0].0 == "/eapi/song/enhance/player/url/v1", "one native EAPI route")
+            expect(requests.count == 1 && requests[0].0 == "/xeapi/song/enhance/player/url/v1", "one native XEAPI route")
             let payload = requests[0].1
             expect(payload["ids"] as? String == "[1]" && payload["level"] as? String == NeteaseAudioPolicy.level(for: quality) && payload["encodeType"] as? String == "flac", "encrypted wire quality/ids/encoding")
-            expect(payload["br"] == nil && payload["unblock"] == nil && payload["header"] != nil, "no legacy br or unblock in v1")
+            expect(payload["br"] == nil && payload["unblock"] == nil && payload["header"] == nil, "XEAPI form does not embed legacy EAPI headers or unblock flags")
             expect(resource.displayQuality.contains("128 kbps") && !resource.displayQuality.contains("FLAC") && resource.headers.isEmpty, "server downgrade honest and audio has no account headers")
         }
+        expect(NeteaseXEAPIServerFixture.keyRequestCount() == 1, "verified public key reused only in this client's memory")
+        expect(store.playbackDiagnostic?.contains("协议：XEAPI") == true, "diagnostic reports actual XEAPI route")
         NeteaseQualityFixture.configure([.row(row)])
         _ = try await store.playback(for: song)
         expect(NeteaseQualityFixture.requests()[0].1["level"] as? String == "exhigh", "old call signature defaults to high")
@@ -72,6 +75,16 @@ import Foundation
         NeteaseQualityFixture.configure([], avatarURL: "https://p1.music.126.net/x?token=secret")
         await store.refresh()
         expect(store.isSignedIn && store.avatarURL == nil, "invalid refreshed avatar clears stale image, not identity")
+        let invalidKeyClient = make()
+        try invalidKeyClient.restoreCredential(try JSONSerialization.data(withJSONObject: [
+            "version": 1, "userID": "7", "cookies": [["name": "MUSIC_U", "value": "synthetic-quality-fixture"]]]))
+        NeteaseXEAPIServerFixture.reset(badSignature: true)
+        NeteaseQualityFixture.configure([.row(row)])
+        do { _ = try await invalidKeyClient.request(.playbackV1, ["ids": "[1]", "level": "lossless", "encodeType": "flac"]); preconditionFailure("unsigned public key accepted") }
+        catch { expect(error as? NeteaseError == .response, "tampered negotiation fails closed") }
+        expect(NeteaseXEAPIServerFixture.keyRequestCount() == 1 && NeteaseQualityFixture.requests().isEmpty, "bad key signature never sends playback, retries or credentials to a different origin")
+        expect(invalidKeyClient.playbackDiagnostic?.negotiatingKey == true && invalidKeyClient.playbackDiagnostic?.httpStatus == nil, "negotiation failure not reported as a completed playback request")
+        invalidKeyClient.invalidate(); NeteaseXEAPIServerFixture.reset()
         await store.signOut()
         expect(store.avatarURL == nil && SecureVault.values.isEmpty, "logout clears avatar and fixture credentials")
         print("PASS: \(count) Netease quality/avatar fixture checks; no real account or audio requests")

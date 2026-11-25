@@ -82,6 +82,12 @@ import Foundation
         let keyURL = try NeteaseWire.url(.qrKey), identityURL = try NeteaseWire.url(.identity)
         expect(keyURL.host == "interface.music.163.com", "QR EAPI host")
         expect(identityURL.path == "/eapi/nuser/account/get", "canonical identity route")
+        let playerURL = try NeteaseWire.url(.playbackV1)
+        expect(playerURL.absoluteString == "https://interface3.music.163.com/xeapi/song/enhance/player/url/v1", "native playback exact XEAPI host and path")
+        expect(NeteaseClient.Endpoint.playbackV1.usesXEAPI && !NeteaseClient.Endpoint.playbackV1.usesEAPI, "v1 never accidentally uses old EAPI")
+        expect(NeteaseWire.isAPIURL(playerURL), "new playback route allowed")
+        expect(!NeteaseWire.isAPIURL(URL(string: "https://interface3.music.163.com/xeapi/nuser/account/get")!), "new host is not a generic credential target")
+        expect(!NeteaseWire.isAPIURL(URL(string: "https://interface3.music.163.com.evil.invalid/xeapi/song/enhance/player/url/v1")!), "new host suffix spoof rejected")
         for code in [800, 801, 802, 803] { try NeteaseWire.validate(code: code, endpoint: .qrCheck) }
         rejects(.verification, "explicit risk check") { try NeteaseWire.validate(code: -460, endpoint: .identity) }
         rejects(.business(400), "fixed code not raw server body") { try NeteaseWire.validate(code: 400, endpoint: .dailySongs) }

@@ -9,8 +9,8 @@ settings:
     SWIFT_VERSION: '5.0'
     TARGETED_DEVICE_FAMILY: '1,2'
     CODE_SIGNING_ALLOWED: NO
-    MARKETING_VERSION: '0.5.2'
-    CURRENT_PROJECT_VERSION: '6'
+    MARKETING_VERSION: '0.5.3'
+    CURRENT_PROJECT_VERSION: '7'
     ENABLE_USER_SCRIPT_SANDBOXING: YES
 targets:
   TingFlow:
@@ -21,6 +21,8 @@ targets:
         excludes:
           - Info.plist
           - '**/*.md'
+    dependencies:
+      - sdk: libz.tbd
     info:
       path: app/TingFlow/Info.plist
       properties:

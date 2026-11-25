@@ -26,8 +26,12 @@ final class NeteaseQualityFixture: URLProtocol, @unchecked Sendable {
         let path = url.path
         var object: [String: Any] = ["code": 200]
         var status = 200
-        if path.contains("/song/enhance/player/url") {
-            let payload = path.hasPrefix("/eapi/") ? Self.openEAPI(request) : [:]
+        var responseBody: Data?
+        if url == NeteaseWire.xeapiKeyURL {
+            do { responseBody = try NeteaseXEAPIServerFixture.keyResponse(request) }
+            catch { client?.urlProtocol(self, didFailWithError: URLError(.cannotDecodeContentData)); return }
+        } else if path.contains("/song/enhance/player/url") {
+            let payload = path.hasPrefix("/xeapi/") ? NeteaseXEAPIServerFixture.openPayload(request) : [:]
             Self.lock.lock()
             Self.records.append((path, payload))
             let reply: Reply
@@ -36,7 +40,9 @@ final class NeteaseQualityFixture: URLProtocol, @unchecked Sendable {
             else { reply = .http(418) } // No infinite retries hidden by a successful default.
             Self.lock.unlock()
             switch reply {
-            case .row(let row): object["data"] = [row]
+            case .row(let row):
+                object["data"] = [row]
+                if path.hasPrefix("/xeapi/") { responseBody = NeteaseXEAPIServerFixture.encryptedResponse(object) }
             case .business(let code): object["code"] = code
             case .http(let code): status = code
             case .transport(let code): client?.urlProtocol(self, didFailWithError: URLError(code)); return
@@ -56,7 +62,7 @@ final class NeteaseQualityFixture: URLProtocol, @unchecked Sendable {
         }
         let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: try! JSONSerialization.data(withJSONObject: object))
+        client?.urlProtocol(self, didLoad: responseBody ?? (try! JSONSerialization.data(withJSONObject: object)))
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() { }
