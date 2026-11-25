@@ -71,7 +71,15 @@ private final class ArtworkFixture: URLProtocol, @unchecked Sendable {
             if let length = image.length { headers["Content-Length"] = String(length) }
             let response = HTTPURLResponse(url: image.target ?? url, statusCode: image.status, httpVersion: "HTTP/1.1", headerFields: headers)!
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            if !image.hold { client?.urlProtocol(self, didLoad: image.data); client?.urlProtocolDidFinishLoading(self) }
+            if image.hold {
+                // URLProtocol's async-byte bridge may wait for a body event before
+                // exposing headers. Supply one byte but keep the stream unfinished:
+                // rejection/logout must still cancel without waiting for completion.
+                client?.urlProtocol(self, didLoad: Data([0]))
+            } else {
+                client?.urlProtocol(self, didLoad: image.data)
+                client?.urlProtocolDidFinishLoading(self)
+            }
             return
         }
         let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
@@ -160,6 +168,7 @@ private final class ArtworkFixture: URLProtocol, @unchecked Sendable {
             await rejected(subImage, "Subsonic rejects invalid binary/status/target #\(index)")
             check(ArtworkFixture.artworkCount() == before + 2, "no follow-up, alternate target or retry")
         }
+        print("PASS: server artwork declared MIME, binary bounds and redirect rejection cases")
         ArtworkFixture.set(.init(status: 404, hold: true))
         let beforeStop = ArtworkFixture.stops()
         check(try await embyImage() == nil, "authenticated 404 only returns nil")
