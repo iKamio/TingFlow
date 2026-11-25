@@ -94,7 +94,7 @@ struct SourceDocumentPicker: UIViewControllerRepresentable {
         private weak var page: UIViewController?
         private weak var navigation: UINavigationController?
         private weak var presentedRoot: UIViewController?
-        private weak var tab: UITabBarController?
+        private weak var ownerTabController: UITabBarController?
         private weak var tabBranch: UIViewController?
         private var hadNavigation = false
         private var wasPresented = false
@@ -116,7 +116,7 @@ struct SourceDocumentPicker: UIViewControllerRepresentable {
                let host = chain.first(where: { node in nav.viewControllers.contains(where: { $0 === node }) }) {
                 navigation = nav; page = host; hadNavigation = true
                 if let tabs = nav.tabBarController {
-                    tab = tabs
+                    ownerTabController = tabs
                     tabBranch = chain.first(where: { node in tabs.viewControllers?.contains(where: { $0 === node }) == true })
                 }
             }
@@ -160,7 +160,7 @@ struct SourceDocumentPicker: UIViewControllerRepresentable {
             if wasPresented {
                 route.ownerStillPresented = presentedRoot.map { $0.presentingViewController != nil || $0.isBeingPresented } ?? false
             }
-            if let tabs = tab, let branch = tabBranch {
+            if let tabs = ownerTabController, let branch = tabBranch {
                 route.hadTab = true; route.ownerTabSelected = tabs.selectedViewController === branch
             }
             return route.shouldExit()
