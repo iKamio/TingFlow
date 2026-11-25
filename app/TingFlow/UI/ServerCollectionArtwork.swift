@@ -137,23 +137,30 @@ private enum ServerArtworkPhase: Equatable {
                 .fill(Color(uiColor: .secondarySystemGroupedBackground))
                 .frame(width: size, height: size)
                 .overlay {
-                    // The fixed square, not image dimensions, owns all geometry.
-                    ZStack {
-                        Image(systemName: symbol)
-                            .font(.system(size: size * 0.38, weight: .regular))
-                            .foregroundStyle(.secondary)
-                        if let image {
-                            Image(uiImage: image).resizable().scaledToFill()
-                                .frame(width: size, height: size).clipped()
+                    // Only the square owns layout/accessibility geometry. A
+                    // landscape scaled-to-fill image may draw outside its frame,
+                    // so keep the decorative overlay out of the accessibility tree.
+                    GeometryReader { geometry in
+                        ZStack {
+                            Image(systemName: symbol)
+                                .font(.system(size: size * 0.38, weight: .regular))
+                                .foregroundStyle(.secondary)
+                            if let image {
+                                Image(uiImage: image).resizable().scaledToFill()
+                                    .frame(width: geometry.size.width, height: geometry.size.height)
+                                    .clipped()
+                            }
+                            if phase == .loading {
+                                ProgressView().controlSize(.small).padding(6)
+                                    .background(.regularMaterial, in: Circle())
+                                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                                    .padding(5)
+                            }
                         }
-                        if phase == .loading {
-                            ProgressView().controlSize(.small).padding(6)
-                                .background(.regularMaterial, in: Circle())
-                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
-                                .padding(5)
-                        }
+                        .frame(width: geometry.size.width, height: geometry.size.height)
+                        .clipped()
                     }
-                    .frame(width: size, height: size).clipped()
+                    .accessibilityHidden(true)
                 }
                 .clipShape(RoundedRectangle(cornerRadius: corner, style: .continuous))
                 .overlay {
