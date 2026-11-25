@@ -172,9 +172,12 @@ enum NeteaseXEAPI {
     static func response(_ data: Data) throws -> [String: Any] {
         guard !data.isEmpty else { throw Failure.invalidResponse }
         guard data.count <= maximumResponseBytes + 16 else { throw Failure.sizeLimit }
-        // Plain JSON business failures are legal. Never fall back to plaintext
-        // after an AES/padding/gzip/JSON failure on the encrypted path.
-        if let plain = try? JSONSerialization.jsonObject(with: data) {
+        // Plain JSON business failures are legal. Only sniff a container prefix;
+        // arbitrary binary/control bytes must take the encrypted path, rather
+        // than being classified by Foundation's platform-specific JSON sniffing.
+        // Never retry plaintext parsing after AES/padding/gzip/JSON failure.
+        let first = data.first { ![UInt8(0x20), 0x09, 0x0a, 0x0d].contains($0) }
+        if (first == 0x7b || first == 0x5b), let plain = try? JSONSerialization.jsonObject(with: data) {
             guard data.count <= maximumResponseBytes else { throw Failure.sizeLimit }
             guard let result = plain as? [String: Any] else { throw Failure.invalidResponse }
             return result
@@ -323,10 +326,22 @@ enum NeteaseXEAPI {
         var output = [UInt8](repeating: 0, count: data.count + 16)
         let capacity = output.count
         var written = 0
+        let options = kCCOptionECBMode | (encrypt ? kCCOptionPKCS7Padding : 0)
         let status = CCCrypt(encrypt ? CCOperation(kCCEncrypt) : CCOperation(kCCDecrypt),
-            CCAlgorithm(kCCAlgorithmAES), CCOptions(kCCOptionPKCS7Padding | kCCOptionECBMode),
+            CCAlgorithm(kCCAlgorithmAES), CCOptions(options),
             bytes, bytes.count, nil, input, input.count, &output, capacity, &written)
         guard status == kCCSuccess else { throw Failure.cryptography }
+        if !encrypt {
+            // Validate PKCS#7 explicitly, not through platform-dependent decoder
+            // behavior. Invalid padding can never reach gzip or JSON parsing.
+            guard written > 0 else { throw Failure.cryptography }
+            let padding = Int(output[written - 1])
+            guard (1...16).contains(padding), padding <= written else { throw Failure.cryptography }
+            var mismatch: UInt8 = 0
+            for index in (written - padding)..<written { mismatch |= output[index] ^ UInt8(padding) }
+            guard mismatch == 0 else { throw Failure.cryptography }
+            written -= padding
+        }
         return Data(output.prefix(written))
     }
 
