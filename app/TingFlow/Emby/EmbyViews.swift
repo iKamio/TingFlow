@@ -48,7 +48,7 @@ struct EmbyAccountView: View {
     }
 }
 
-struct EmbyLibraryView: View {
+@MainActor struct EmbyLibraryView: View {
     @ObservedObject var store: EmbyStore
     let onPlay: ([Song], Int) -> Void
     init(store: EmbyStore, onPlay: @escaping ([Song], Int) -> Void) {
@@ -86,19 +86,39 @@ struct EmbyLibraryView: View {
                     }
                 } else if kind == .albums {
                     ForEach(store.albums) { album in
-                        NavigationLink(album.name) {
-                            EmbyCollectionView(store: store, title: album.name, onPlay: onPlay) { cursor in
+                        let collection = ServerCollectionInfo(service: "emby", kind: .album, id: album.id,
+                                                              title: album.name, artist: album.artist,
+                                                              songCount: album.songCount, accountScope: album.accountScope,
+                                                              artworkVersion: album.primaryImageTag)
+                        NavigationLink {
+                            EmbyCollectionView(store: store, collection: collection, onPlay: onPlay,
+                                               artwork: { pixels in try await store.artwork(for: album, pixels: pixels) }) { cursor in
                                 try await store.tracks(in: album, cursor: cursor)
                             }
+                        } label: {
+                            ServerCollectionRow(collection: collection, scope: store.isSignedIn ? store.scopeID : nil) { pixels in
+                                try await store.artwork(for: album, pixels: pixels)
+                            }
                         }
+                        .accessibilityIdentifier(collection.accessibilityID + ".row")
                     }
                 } else {
                     ForEach(store.playlists) { playlist in
-                        NavigationLink(playlist.name) {
-                            EmbyCollectionView(store: store, title: playlist.name, onPlay: onPlay) { cursor in
+                        let collection = ServerCollectionInfo(service: "emby", kind: .playlist, id: playlist.id,
+                                                              title: playlist.name, artist: playlist.artist,
+                                                              songCount: playlist.songCount, accountScope: playlist.accountScope,
+                                                              artworkVersion: playlist.primaryImageTag)
+                        NavigationLink {
+                            EmbyCollectionView(store: store, collection: collection, onPlay: onPlay,
+                                               artwork: { pixels in try await store.artwork(for: playlist, pixels: pixels) }) { cursor in
                                 try await store.tracks(in: playlist, cursor: cursor)
                             }
+                        } label: {
+                            ServerCollectionRow(collection: collection, scope: store.isSignedIn ? store.scopeID : nil) { pixels in
+                                try await store.artwork(for: playlist, pixels: pixels)
+                            }
                         }
+                        .accessibilityIdentifier(collection.accessibilityID + ".row")
                     }
                 }
                 pagingRow(kind)
@@ -135,10 +155,11 @@ private struct EmbySongRow: View {
     }
 }
 
-private struct EmbyCollectionView: View {
+@MainActor private struct EmbyCollectionView: View {
     @ObservedObject var store: EmbyStore
-    let title: String
+    let collection: ServerCollectionInfo
     let onPlay: ([Song], Int) -> Void
+    let artwork: @MainActor (Int) async throws -> Data?
     let load: (EmbyCursor) async throws -> EmbyTrackBatch
     @State private var tracks: [Song] = []
     @State private var cursor = EmbyCursor()
@@ -147,50 +168,65 @@ private struct EmbyCollectionView: View {
     @State private var loading = false
     @State private var error: String?
     @State private var ticket = UUID()
-    private var visible: [Song] { tracks.filter { $0.accountScope == store.scopeID } }
+    private var isCurrent: Bool { store.isSignedIn && store.scopeID == collection.accountScope }
+    private var visible: [Song] { isCurrent ? tracks.filter { $0.accountScope == store.scopeID } : [] }
     var body: some View {
         List {
             Section {
-                if loaded {
+                ServerCollectionHeader(collection: collection, scope: store.isSignedIn ? store.scopeID : nil, load: artwork)
+            }
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
+            Section {
+                if !isCurrent {
+                    Text("账号已变化，请返回音乐库。").foregroundStyle(.secondary)
+                } else if loaded {
                     Text("已读取 \(cursor.nextIndex)" + (cursor.total.map { " / \($0)" } ?? "") + " 条 · 队列仅含已加载音频")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if !visible.isEmpty {
-                    Button { onPlay(visible, 0) } label: { Label("播放已加载曲目", systemImage: "play.fill") }
+                    Button { onPlay(visible, 0) } label: {
+                        Label("播放已加载曲目", systemImage: "play.fill").frame(minHeight: 44)
+                    }
+                    .accessibilityIdentifier(collection.accessibilityID + ".playLoaded")
                 }
             }
-            if let error { Text(error).foregroundStyle(.red) }
+            if isCurrent, let error { Text(error).foregroundStyle(.red) }
             // Use queue position: a song may repeat in a playlist.
             ForEach(Array(visible.enumerated()), id: \.offset) { index, song in
                 Button { onPlay(visible, index) } label: { EmbySongRow(song: song) }
             }
-            if loading { ProgressView("读取歌曲…") }
-            else if store.isSignedIn, !loaded || cursor.hasMore || error != nil {
+            if isCurrent && loading { ProgressView("读取歌曲…") }
+            else if isCurrent, !loaded || cursor.hasMore || error != nil {
                 Button(error == nil ? "加载更多曲目" : "重试加载曲目") { Task { await fetch(reset: false) } }
-            } else if loaded && visible.isEmpty { Text("暂无音频曲目").foregroundStyle(.secondary) }
+            } else if isCurrent && loaded && visible.isEmpty { Text("暂无音频曲目").foregroundStyle(.secondary) }
         }
-        .navigationTitle(title)
+        .navigationTitle(collection.title)
+        .navigationBarTitleDisplayMode(.inline)
         .task(id: store.scopeID) {
-            tracks = []; cursor = EmbyCursor(); loaded = false; loading = false
+            tracks = []; cursor = EmbyCursor(); loaded = false; loading = false; error = nil; retryFromStart = false
             await fetch(reset: true)
         }
         .refreshable { await fetch(reset: true) }
-        .onChange(of: store.scopeID) { _ in ticket = UUID(); tracks = []; loaded = false; loading = false }
+        .onChange(of: store.scopeID) { _ in
+            ticket = UUID(); tracks = []; cursor = EmbyCursor(); loaded = false; loading = false
+            error = nil; retryFromStart = false
+        }
     }
     private func fetch(reset: Bool) async {
-        guard let scope = store.scopeID, reset || !loading else { return }
+        guard isCurrent, let scope = store.scopeID, reset || !loading else { return }
         let shouldReset = reset || retryFromStart
         let id = UUID(); ticket = id; loading = true; error = nil
         defer { if ticket == id { loading = false } }
         do {
             let result = try await load(shouldReset ? EmbyCursor() : cursor)
             try Task.checkCancellation()
-            guard ticket == id, store.scopeID == scope, result.accountScope == scope else { return }
+            guard ticket == id, isCurrent, store.scopeID == scope, result.accountScope == scope else { return }
             tracks = (shouldReset ? [] : tracks) + result.songs
             cursor = result.cursor; loaded = true; retryFromStart = false
         } catch is CancellationError { }
         catch {
-            guard ticket == id, !Task.isCancelled, store.scopeID == scope else { return }
+            guard ticket == id, !Task.isCancelled, isCurrent, store.scopeID == scope else { return }
             self.error = (error as? EmbyFailure ?? .network).localizedDescription
             retryFromStart = shouldReset
         }

@@ -47,7 +47,7 @@ struct SubsonicAccountView: View {
     }
 }
 
-struct SubsonicLibraryView: View {
+@MainActor struct SubsonicLibraryView: View {
     @ObservedObject var store: SubsonicStore
     let onPlay: ([Song], Int) -> Void
     @State private var query = ""
@@ -108,11 +108,21 @@ struct SubsonicLibraryView: View {
         List {
             if store.isSignedIn {
                 ForEach(store.albums) { album in
-                    NavigationLink(album.name) {
-                        SubsonicCollectionView(store: store, scope: album.accountScope, title: album.name, onPlay: onPlay) {
+                    let collection = ServerCollectionInfo(service: "subsonic", kind: .album, id: album.id,
+                                                          title: album.name, artist: album.artist,
+                                                          songCount: album.songCount, accountScope: album.accountScope,
+                                                          artworkVersion: album.coverArtID)
+                    NavigationLink {
+                        SubsonicCollectionView(store: store, collection: collection, onPlay: onPlay,
+                                               artwork: { pixels in try await store.artwork(for: album, pixels: pixels) }) {
                             try await store.tracks(in: album)
                         }
+                    } label: {
+                        ServerCollectionRow(collection: collection, scope: store.isSignedIn ? store.scopeID : nil) { pixels in
+                            try await store.artwork(for: album, pixels: pixels)
+                        }
                     }
+                    .accessibilityIdentifier(collection.accessibilityID + ".row")
                 }
                 if store.albums.count >= SubsonicPolicy.pageSize {
                     Button("加载更多专辑") { Task { await store.loadMoreAlbums() } }.disabled(store.isLoading)
@@ -125,11 +135,21 @@ struct SubsonicLibraryView: View {
         List {
             if store.isSignedIn {
                 ForEach(store.playlists) { playlist in
-                    NavigationLink(playlist.name) {
-                        SubsonicCollectionView(store: store, scope: playlist.accountScope, title: playlist.name, onPlay: onPlay) {
+                    let collection = ServerCollectionInfo(service: "subsonic", kind: .playlist, id: playlist.id,
+                                                          title: playlist.name, artist: playlist.artist,
+                                                          songCount: playlist.songCount, accountScope: playlist.accountScope,
+                                                          artworkVersion: playlist.coverArtID)
+                    NavigationLink {
+                        SubsonicCollectionView(store: store, collection: collection, onPlay: onPlay,
+                                               artwork: { pixels in try await store.artwork(for: playlist, pixels: pixels) }) {
                             try await store.tracks(in: playlist)
                         }
+                    } label: {
+                        ServerCollectionRow(collection: collection, scope: store.isSignedIn ? store.scopeID : nil) { pixels in
+                            try await store.artwork(for: playlist, pixels: pixels)
+                        }
                     }
+                    .accessibilityIdentifier(collection.accessibilityID + ".row")
                 }
                 if store.playlists.isEmpty { Text("暂无歌单").foregroundStyle(.secondary) }
             } else { Text("账号已退出").foregroundStyle(.secondary) }
@@ -171,46 +191,64 @@ private struct SubsonicSongRow: View {
     }
 }
 
-private struct SubsonicCollectionView: View {
+@MainActor private struct SubsonicCollectionView: View {
     @ObservedObject var store: SubsonicStore
-    let scope: String
-    let title: String
+    let collection: ServerCollectionInfo
     let onPlay: ([Song], Int) -> Void
+    let artwork: @MainActor (Int) async throws -> Data?
     let load: () async throws -> [Song]
     @State private var tracks: [Song] = []
     @State private var loading = false
     @State private var loaded = false
     @State private var error: String?
+    @State private var ticket = UUID()
+    private var isCurrent: Bool { store.scopeID == collection.accountScope && store.isSignedIn }
+    private var visible: [Song] { isCurrent ? tracks.filter { $0.accountScope == collection.accountScope } : [] }
 
     var body: some View {
         List {
-            if let error { Text(error).foregroundStyle(.red) }
-            if loading { ProgressView("读取歌曲…") }
-            if loaded && tracks.isEmpty && !loading { Text("暂无音频曲目").foregroundStyle(.secondary) }
-            if store.scopeID == scope, store.isSignedIn {
-                ForEach(Array(tracks.enumerated()), id: \.offset) { index, song in
-                    Button { onPlay(tracks, index) } label: { SubsonicSongRow(song: song) }
+            Section {
+                ServerCollectionHeader(collection: collection, scope: store.isSignedIn ? store.scopeID : nil, load: artwork)
+            }
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
+            if isCurrent {
+                if loaded && !visible.isEmpty {
+                    Button { onPlay(visible, 0) } label: {
+                        Label("播放全部已加载曲目", systemImage: "play.fill").frame(minHeight: 44)
+                    }
+                    .accessibilityIdentifier(collection.accessibilityID + ".playLoaded")
                 }
-                if loaded && !tracks.isEmpty {
-                    Button { onPlay(tracks, 0) } label: { Label("播放全部已加载曲目", systemImage: "play.fill") }
+                if let error { Text(error).foregroundStyle(.red) }
+                if loading { ProgressView("读取歌曲…") }
+                if loaded && visible.isEmpty && !loading { Text("暂无音频曲目").foregroundStyle(.secondary) }
+                // Queue positions retain server order and repeated playlist entries.
+                ForEach(Array(visible.enumerated()), id: \.offset) { index, song in
+                    Button { onPlay(visible, index) } label: { SubsonicSongRow(song: song) }
                 }
             } else { Text("账号已变化，请返回音乐库。").foregroundStyle(.secondary) }
         }
-        .navigationTitle(title)
+        .navigationTitle(collection.title)
+        .navigationBarTitleDisplayMode(.inline)
         .task(id: store.scopeID) { await fetch() }
-        .onChange(of: store.scopeID) { _ in tracks = []; loaded = false; loading = false; error = nil }
+        .onChange(of: store.scopeID) { _ in
+            ticket = UUID(); tracks = []; loaded = false; loading = false; error = nil
+        }
         .refreshable { await fetch() }
     }
     private func fetch() async {
-        guard !loading, store.scopeID == scope, store.isSignedIn else { return }
-        loading = true; error = nil
-        defer { loading = false }
+        guard !loading, isCurrent else { return }
+        let id = UUID(); ticket = id; loading = true; error = nil
+        defer { if ticket == id { loading = false } }
         do {
             let result = try await load()
             try Task.checkCancellation()
-            guard store.scopeID == scope, store.isSignedIn else { return }
+            guard ticket == id, isCurrent else { return }
             tracks = result; loaded = true
         } catch is CancellationError { }
-        catch { if store.scopeID == scope { self.error = (error as? SubsonicFailure ?? .network).localizedDescription } }
+        catch {
+            guard ticket == id, !Task.isCancelled, isCurrent else { return }
+            self.error = (error as? SubsonicFailure ?? .network).localizedDescription
+        }
     }
 }

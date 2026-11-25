@@ -1,11 +1,15 @@
 #!/bin/bash
 set -euo pipefail
-CORE=(app/TingFlow/Core/Models.swift app/TingFlow/Core/PlaybackResource.swift app/TingFlow/Playback/ListeningSession.swift)
+CORE=(app/TingFlow/Core/Models.swift app/TingFlow/Core/PlaybackResource.swift app/TingFlow/Playback/ListeningSession.swift app/TingFlow/Core/ServerArtworkCache.swift)
 NCM=(app/TingFlow/Netease/NeteaseModels.swift app/TingFlow/Netease/NeteaseAudioPolicy.swift app/TingFlow/Netease/NeteasePlaybackDiagnostic.swift app/TingFlow/Netease/NeteaseCloudPolicy.swift app/TingFlow/Netease/NeteaseHistoryPolicy.swift app/TingFlow/Netease/NeteaseCrypto.swift app/TingFlow/Netease/NeteaseXEAPI.swift app/TingFlow/Netease/NeteaseXEAPISession.swift app/TingFlow/Netease/NeteaseWire.swift app/TingFlow/Netease/NeteaseClient.swift)
 EMBY=(app/TingFlow/Emby/EmbyClient.swift app/TingFlow/Emby/EmbyPaging.swift app/TingFlow/Emby/EmbyPlaybackDiagnostic.swift app/TingFlow/Emby/EmbyStore.swift)
 SOURCES=(app/TingFlow/Sources/SourceModels.swift app/TingFlow/Sources/SourceHTTP.swift app/TingFlow/Sources/SourceRuntime.swift app/TingFlow/Sources/SourceStore.swift)
 TMP=${RUNNER_TEMP:-/tmp}
 node --check app/TingFlow/Sources/SourceBootstrap.js
+xcrun swiftc -swift-version 5 app/TingFlow/Core/ServerArtworkCache.swift tests/ServerArtworkCacheChecks.swift -o "$TMP/server-artwork-cache-checks"
+"$TMP/server-artwork-cache-checks"
+xcrun swiftc -swift-version 5 "${CORE[@]}" "${EMBY[@]}" app/TingFlow/Subsonic/SubsonicClient.swift app/TingFlow/Subsonic/SubsonicStore.swift tests/ServerArtworkTransportChecks.swift -o "$TMP/server-artwork-transport-checks"
+"$TMP/server-artwork-transport-checks"
 node tests/NeteaseVectors.js
 node tests/NeteaseXEAPIVectors.js --check
 xcrun swiftc -swift-version 5 app/TingFlow/Netease/NeteaseXEAPI.swift tests/NeteaseXEAPIChecks.swift -lz -o "$TMP/netease-xeapi-checks"

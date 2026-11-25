@@ -4,8 +4,15 @@ import SwiftUI
 struct TingFlowApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
-                .preferredColorScheme(nil)
+            #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("-TingFlowServerCoverFixture") {
+                ServerArtworkPreviewFixture()
+            } else {
+                ContentView().preferredColorScheme(nil)
+            }
+            #else
+            ContentView().preferredColorScheme(nil)
+            #endif
         }
     }
 }

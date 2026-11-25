@@ -1,24 +1,27 @@
 import Foundation
 import CryptoKit
 import Security
+import ImageIO
 
 struct SubsonicAlbum: Identifiable, Codable, Hashable {
     let id: String
     let name: String
-    let artist: String?
+    var artist: String? = nil
     let accountScope: String
     var coverArtID: String? = nil
+    var songCount: Int? = nil
 }
 struct SubsonicPlaylist: Identifiable, Codable, Hashable {
     let id: String
     let name: String
-    let artist: String?
+    var artist: String? = nil
     let accountScope: String
     var coverArtID: String? = nil
+    var songCount: Int? = nil
 }
 
 enum SubsonicFailure: Error, LocalizedError, Equatable {
-    case address, response, authentication, forbidden, incompatible, network, redirect, limit, storage, account, signedOut
+    case address, response, authentication, forbidden, incompatible, network, redirect, limit, artworkLimit, storage, account, signedOut
     var errorDescription: String? {
         switch self {
         case .address: return "请输入无凭据、查询、片段或路径跳转的最终 HTTPS 服务器根地址。"
@@ -28,6 +31,7 @@ enum SubsonicFailure: Error, LocalizedError, Equatable {
         case .incompatible: return "服务器不支持此版本的 Subsonic 令牌接口。"
         case .network: return "无法连接音乐服务器，请检查网络及 HTTPS 证书。"
         case .redirect: return "已拒绝服务器重定向，请填写最终 HTTPS API 根地址。"
+        case .artworkLimit: return "音乐服务器原图超过 4,000,000 字节安全上限，未加载。"
         case .limit: return "本次响应超过 8 MiB 安全上限；请缩小服务器歌单或搜索范围。"
         case .storage: return "本机安全存储不可用，请解锁设备并检查空间后重试。"
         case .account: return "此内容不属于当前音乐服务器账户。"
@@ -42,6 +46,12 @@ enum SubsonicPolicy {
     static let pageSize = 100
     static func validID(_ value: String) -> Bool {
         !value.isEmpty && value.utf8.count <= 2048 && value.rangeOfCharacter(from: .controlCharacters) == nil
+    }
+    static func validArtworkID(_ value: String) -> Bool {
+        validID(value) && !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !value.contains("://")
+    }
+    static func artworkRevision(_ id: String) -> String {
+        SHA256.hash(data: Data(id.utf8)).map { String(format: "%02x", $0) }.joined()
     }
     static func validUsername(_ value: String) -> Bool { validID(value) && !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     static func base(_ input: String) throws -> URL {
@@ -69,7 +79,7 @@ enum SubsonicPolicy {
         return url
     }
     static func endpoint(_ base: URL, _ method: String, query: [URLQueryItem] = []) throws -> URL {
-        let allowed = ["ping", "getAlbumList2", "getPlaylists", "getAlbum", "getPlaylist", "search3", "stream"]
+        let allowed = ["ping", "getAlbumList2", "getPlaylists", "getAlbum", "getPlaylist", "search3", "stream", "getCoverArt"]
         guard allowed.contains(method), try self.base(base.absoluteString) == base,
               var c = URLComponents(url: base, resolvingAgainstBaseURL: false) else { throw SubsonicFailure.address }
         c.percentEncodedPath += "/rest/\(method).view"
@@ -126,6 +136,25 @@ struct SubsonicRecord: Decodable {
     let isDir: Bool?
     let isVideo: Bool?
     let type: String?
+    let songCount: Int?
+    private enum CodingKeys: String, CodingKey {
+        case id, name, title, artist, album, albumId, duration, coverArt, isDir, isVideo, type, songCount
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decodeIfPresent(String.self, forKey: .name)
+        title = try c.decodeIfPresent(String.self, forKey: .title)
+        artist = try c.decodeIfPresent(String.self, forKey: .artist)
+        album = try c.decodeIfPresent(String.self, forKey: .album)
+        albumId = try c.decodeIfPresent(String.self, forKey: .albumId)
+        duration = try c.decodeIfPresent(Double.self, forKey: .duration)
+        coverArt = try? c.decode(String.self, forKey: .coverArt)
+        isDir = try c.decodeIfPresent(Bool.self, forKey: .isDir)
+        isVideo = try c.decodeIfPresent(Bool.self, forKey: .isVideo)
+        type = try c.decodeIfPresent(String.self, forKey: .type)
+        songCount = (try? c.decode(Int.self, forKey: .songCount)).flatMap { $0 >= 0 ? $0 : nil }
+    }
     func song(scope: String) -> Song? {
         guard SubsonicPolicy.validID(id), isDir != true, isVideo != true, type != "video" else { return nil }
         let seconds = duration ?? 0
@@ -204,7 +233,7 @@ final class SubsonicClient {
             try Task.checkCancellation()
             guard credential.valid, credential.server == base else { throw SubsonicFailure.account }
             let reserved: Set<String> = ["u", "t", "s", "v", "c", "f", "p"]
-            guard !parameters.contains(where: { reserved.contains($0.name) }), method != "stream" else { throw SubsonicFailure.response }
+            guard !parameters.contains(where: { reserved.contains($0.name) }), method != "stream", method != "getCoverArt" else { throw SubsonicFailure.response }
             let url = try SubsonicPolicy.endpoint(base, method)
             var request = URLRequest(url: url)
             request.httpMethod = "POST"
@@ -235,11 +264,70 @@ final class SubsonicClient {
             throw SubsonicFailure.safe(error)
         }
     }
+    func artwork(id: String, credential: SubsonicCredential, pixels: Int = 320) async throws -> Data? {
+        do {
+            try Task.checkCancellation()
+            guard credential.valid, credential.server == base, SubsonicPolicy.validArtworkID(id) else { throw SubsonicFailure.account }
+            let url = try SubsonicPolicy.endpoint(base, "getCoverArt")
+            var request = URLRequest(url: url)
+            request.httpShouldHandleCookies = false
+            request.httpMethod = "POST"
+            request.httpBody = SubsonicPolicy.form(credential.parameters + [
+                URLQueryItem(name: "id", value: id), URLQueryItem(name: "size", value: pixels <= 320 ? "320" : "700")])
+            request.setValue("application/x-www-form-urlencoded; charset=utf-8", forHTTPHeaderField: "Content-Type")
+            request.setValue(SubsonicArtworkBody.accept, forHTTPHeaderField: "Accept")
+            let (bytes, response) = try await session.bytes(for: request)
+            defer { bytes.task.cancel() }
+            guard let http = response as? HTTPURLResponse, response.url == url else { throw SubsonicFailure.redirect }
+            switch http.statusCode {
+            case 200..<300: break
+            case 404: return nil
+            case 300..<400: throw SubsonicFailure.redirect
+            case 401: throw SubsonicFailure.authentication
+            case 403: throw SubsonicFailure.forbidden
+            default: throw SubsonicFailure.network
+            }
+            guard let mime = response.mimeType?.lowercased(), SubsonicArtworkBody.types[mime] != nil else { throw SubsonicFailure.response }
+            guard response.expectedContentLength <= Int64(SubsonicArtworkBody.byteLimit) else { throw SubsonicFailure.artworkLimit }
+            var data = Data()
+            for try await byte in bytes {
+                guard data.count < SubsonicArtworkBody.byteLimit else { throw SubsonicFailure.artworkLimit }
+                data.append(byte)
+            }
+            try Task.checkCancellation()
+            guard SubsonicArtworkBody.valid(data, mime: mime) else { throw SubsonicFailure.response }
+            return data
+        } catch is CancellationError { throw CancellationError() }
+        catch { if Task.isCancelled { throw CancellationError() }; throw SubsonicFailure.safe(error) }
+    }
     func playback(id: String, credential: SubsonicCredential) throws -> PlaybackResource {
         guard credential.valid, credential.server == base, SubsonicPolicy.validID(id) else { throw SubsonicFailure.account }
         // GET authentication is required by the standard. This URL must stay memory-only.
         let url = try SubsonicPolicy.endpoint(base, "stream", query: credential.parameters + [
             URLQueryItem(name: "id", value: id), URLQueryItem(name: "format", value: "raw")])
         return PlaybackResource(url: url, displayQuality: credential.navidrome ? "Navidrome · 原始音频" : "Subsonic · 原始音频", requiresResourceLoader: true)
+    }
+}
+
+private enum SubsonicArtworkBody {
+    static let byteLimit = 4_000_000
+    static let types: [String: Set<String>] = [
+        "image/jpeg": ["public.jpeg"], "image/png": ["public.png"],
+        "image/webp": ["org.webmproject.webp"], "image/gif": ["com.compuserve.gif"],
+        "image/heic": ["public.heic", "public.heif"], "image/heif": ["public.heif", "public.heic"]
+    ]
+    static let accept = "image/jpeg, image/png, image/webp, image/heic, image/heif, image/gif"
+    static func valid(_ data: Data, mime: String) -> Bool {
+        guard !data.isEmpty, data.count <= byteLimit,
+              let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let type = CGImageSourceGetType(source), types[mime]?.contains(type as String) == true,
+              CGImageSourceGetCount(source) > 0,
+              CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete,
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any],
+              let width = properties[kCGImagePropertyPixelWidth as String] as? NSNumber,
+              let height = properties[kCGImagePropertyPixelHeight as String] as? NSNumber
+        else { return false }
+        let w = width.int64Value, h = height.int64Value
+        return (1...16_384).contains(w) && (1...16_384).contains(h) && w * h <= 80_000_000
     }
 }

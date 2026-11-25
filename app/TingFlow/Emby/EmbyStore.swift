@@ -41,6 +41,7 @@ final class EmbyStore: ObservableObject {
     private let device: String
     private let cache: URL
     private let makeClient: (URL, String) -> EmbyClient
+    private let artworkCache = ServerArtworkCache()
 
     init(cacheDirectory: URL? = nil, clientFactory: @escaping (URL, String) -> EmbyClient = { EmbyClient(base: $0, device: $1) }) {
         makeClient = clientFactory
@@ -149,6 +150,7 @@ final class EmbyStore: ObservableObject {
 
     func refresh() async {
         guard let context = auth else { return }
+        artworkCache.clear()
         let ticket = UUID(); refreshID = ticket; isLoading = true; errorMessage = nil
         // Only one bounded page per type. Each successful type publishes immediately.
         for kind in EmbyLibraryKind.allCases {
@@ -179,9 +181,14 @@ final class EmbyStore: ObservableObject {
         libraryPages[kind] = state
         do {
             let oldCursor = reset ? EmbyCursor() : state.cursor
-            let query = [URLQueryItem(name: "Recursive", value: "true"),
+            var query = [URLQueryItem(name: "Recursive", value: "true"),
                          URLQueryItem(name: "IncludeItemTypes", value: kind.itemType),
                          URLQueryItem(name: "SortBy", value: "SortName"), URLQueryItem(name: "SortOrder", value: "Ascending")]
+            if kind != .songs {
+                query += [URLQueryItem(name: "Fields", value: "ChildCount"),
+                          URLQueryItem(name: "EnableImages", value: "true"),
+                          URLQueryItem(name: "EnableImageTypes", value: "Primary")]
+            }
             let batch = try await page(context, path: ["Users", context.credential.user, "Items"], query: query, cursor: oldCursor)
             try current(context)
             guard refreshID == refresh, libraryPages[kind]?.ticket == ticket else { return }
@@ -193,14 +200,16 @@ final class EmbyStore: ObservableObject {
             case .albums:
                 let loaded = batch.items.compactMap { item -> EmbyAlbum? in
                     guard item.Type == "MusicAlbum", let id = item.Id, EmbyAddress.validID(id) else { return nil }
-                    return EmbyAlbum(id: id, name: item.Name ?? "未知专辑", accountScope: scope)
+                    return EmbyAlbum(id: id, name: item.Name ?? "未知专辑", accountScope: scope,
+                                     artist: item.collectionArtist, songCount: item.ChildCount, primaryImageTag: item.primaryImageTag)
                 }
                 albums = merge(reset ? [] : albums, loaded, id: { $0.id })
             case .playlists:
                 let loaded = batch.items.compactMap { item -> EmbyPlaylist? in
                     guard item.Type == "Playlist", item.MediaType == "Audio", let id = item.Id,
                           EmbyAddress.validID(id) else { return nil }
-                    return EmbyPlaylist(id: id, name: item.Name ?? "未命名歌单", accountScope: scope)
+                    return EmbyPlaylist(id: id, name: item.Name ?? "未命名歌单", accountScope: scope,
+                                        artist: item.collectionArtist, songCount: item.ChildCount, primaryImageTag: item.primaryImageTag)
                 }
                 playlists = merge(reset ? [] : playlists, loaded, id: { $0.id })
             }
@@ -260,6 +269,42 @@ final class EmbyStore: ObservableObject {
                 searchNotice = "Emby 先显示 \(batch.cursor.nextIndex)\(total) 条搜索结果；请细化关键词，或到音乐库逐页浏览。"
             }
             return batch.items.compactMap { $0.song(scope: context.credential.scope) }
+        } catch { throw failure(error, context) }
+    }
+
+    func artwork(for album: EmbyAlbum, pixels: Int = 320) async throws -> Data? {
+        try await collectionArtwork(id: album.id, revision: album.primaryImageTag, scope: album.accountScope, playlist: false, pixels: pixels)
+    }
+    func artwork(for playlist: EmbyPlaylist, pixels: Int = 320) async throws -> Data? {
+        try await collectionArtwork(id: playlist.id, revision: playlist.primaryImageTag, scope: playlist.accountScope, playlist: true, pixels: pixels)
+    }
+    private func verifyArtwork(_ context: Context, id: String, revision: String?, scope: String, playlist: Bool) throws {
+        try current(context)
+        guard isSignedIn, scopeID == scope, scope == context.credential.scope, EmbyAddress.validID(id),
+              revision.map(EmbyAddress.validImageTag) != false else { throw EmbyFailure.account }
+        if playlist {
+            guard let item = playlists.first(where: { $0.id == id }), item.accountScope == scope,
+                  item.primaryImageTag == revision else { throw EmbyFailure.account }
+        } else {
+            guard let item = albums.first(where: { $0.id == id }), item.accountScope == scope,
+                  item.primaryImageTag == revision else { throw EmbyFailure.account }
+        }
+    }
+    private func collectionArtwork(id: String, revision: String?, scope: String, playlist: Bool, pixels: Int) async throws -> Data? {
+        let context = try context()
+        try verifyArtwork(context, id: id, revision: revision, scope: scope, playlist: playlist)
+        let size = ServerArtworkCache.pixels(pixels)
+        let key = ServerArtworkCache.Key(scope: "emby:" + scope, id: (playlist ? "playlist:" : "album:") + id, revision: revision, pixels: size)
+        do {
+            let data = try await artworkCache.data(for: key) { [weak self] in
+                guard let self else { throw CancellationError() }
+                try self.verifyArtwork(context, id: id, revision: revision, scope: scope, playlist: playlist)
+                let result = try await context.client.artwork(item: id, tag: revision, token: context.credential.token, user: context.credential.user, pixels: size)
+                try self.verifyArtwork(context, id: id, revision: revision, scope: scope, playlist: playlist)
+                return result
+            }
+            try verifyArtwork(context, id: id, revision: revision, scope: scope, playlist: playlist)
+            return data
         } catch { throw failure(error, context) }
     }
 
@@ -377,7 +422,7 @@ final class EmbyStore: ObservableObject {
     }
     @discardableResult private func clearLocal() -> Bool {
         let scope = auth?.credential.scope ?? restoring?.scope
-        generation = UUID(); client?.cancel(); client = nil; auth = nil; restoring = nil
+        generation = UUID(); artworkCache.clear(); client?.cancel(); client = nil; auth = nil; restoring = nil
         isSignedIn = false; accountName = ""; scopeID = nil
         songs = []; albums = []; playlists = []; isLoading = false; errorMessage = nil
         libraryPages = [:]; searchNotice = nil; playbackDiagnostic = nil; refreshID = UUID(); searchID = UUID()

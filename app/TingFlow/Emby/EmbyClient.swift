@@ -1,10 +1,14 @@
 import Foundation
 import CryptoKit
+import ImageIO
 
 struct EmbyAlbum: Identifiable, Codable, Hashable {
     let id: String
     let name: String
     let accountScope: String
+    var artist: String? = nil
+    var songCount: Int? = nil
+    var primaryImageTag: String? = nil
     var title: String { name }
 }
 
@@ -12,12 +16,15 @@ struct EmbyPlaylist: Identifiable, Codable, Hashable {
     let id: String
     let name: String
     let accountScope: String
+    var artist: String? = nil
+    var songCount: Int? = nil
+    var primaryImageTag: String? = nil
     var title: String { name }
 }
 
 enum EmbyFailure: LocalizedError {
     case address, response, unauthorized, forbidden, http(Int), network, redirect
-    case signedOut, account, unsupported, limit, paging, storage, remoteLogout
+    case signedOut, account, unsupported, limit, artworkLimit, paging, storage, remoteLogout
     case rateLimited, noCompatibleStream, missingSources, emptySources, playbackError
     case unverifiedAudio, liveStream, transcodingRequired
     var errorDescription: String? {
@@ -40,6 +47,7 @@ enum EmbyFailure: LocalizedError {
         case .unverifiedAudio: return "无法确认音频的容器与编码是否适合直放；未尝试未知格式。"
         case .liveStream: return "此媒体源需要打开或维护直播会话，当前尚不支持。"
         case .transcodingRequired: return "此音频无法按当前配置直放，可能需要服务端转码；当前尚不支持转码播放，请选择可直接播放的版本。"
+        case .artworkLimit: return "Emby 原图超过 4,000,000 字节安全上限，未加载。"
         case .limit: return "本次只读取一个分页窗口，请继续加载或缩小搜索范围。"
         case .paging: return "服务端分页未前进或提前返回空页；已保留读取结果，请刷新后重试。"
         case .storage: return "Emby 本地安全存储不可用，请解锁设备并检查空间后重试。"
@@ -53,11 +61,53 @@ struct EmbyUser: Decodable { let Id: String?; let Name: String? }
 struct EmbyLogin: Decodable { let User: EmbyUser?; let AccessToken: String?; let ServerId: String? }
 struct EmbyServer: Decodable { let Id: String? }
 struct EmbyArtist: Decodable { let Name: String? }
+struct EmbyImageTags: Decodable {
+    let Primary: String?
+    private enum CodingKeys: String, CodingKey { case Primary }
+    init(from decoder: Decoder) throws {
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        Primary = try? fields.decode(String.self, forKey: .Primary)
+    }
+}
 struct EmbyItem: Decodable {
     let Id: String?; let Name: String?; let `Type`: String?; let MediaType: String?
     let RunTimeTicks: Int64?; let Album: String?; let AlbumId: String?
     let ArtistItems: [EmbyArtist]?; let Artists: [String]?; let PlaylistItemId: String?
     let Container: String?; let MediaStreams: [EmbyStream]?; let MediaSources: [EmbySource]?
+    let ImageTags: EmbyImageTags?; let ChildCount: Int?; let AlbumArtist: String?
+    let AlbumArtists: [EmbyArtist]?
+    private enum CodingKeys: String, CodingKey {
+        case Id, Name, `Type`, MediaType, RunTimeTicks, Album, AlbumId, ArtistItems, Artists, PlaylistItemId
+        case Container, MediaStreams, MediaSources, ImageTags, ChildCount, AlbumArtist, AlbumArtists
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        Id = try c.decodeIfPresent(String.self, forKey: .Id)
+        Name = try c.decodeIfPresent(String.self, forKey: .Name)
+        Type = try c.decodeIfPresent(String.self, forKey: .Type)
+        MediaType = try c.decodeIfPresent(String.self, forKey: .MediaType)
+        RunTimeTicks = try c.decodeIfPresent(Int64.self, forKey: .RunTimeTicks)
+        Album = try c.decodeIfPresent(String.self, forKey: .Album)
+        AlbumId = try c.decodeIfPresent(String.self, forKey: .AlbumId)
+        ArtistItems = try c.decodeIfPresent([EmbyArtist].self, forKey: .ArtistItems)
+        Artists = try c.decodeIfPresent([String].self, forKey: .Artists)
+        PlaylistItemId = try c.decodeIfPresent(String.self, forKey: .PlaylistItemId)
+        Container = try c.decodeIfPresent(String.self, forKey: .Container)
+        MediaStreams = try c.decodeIfPresent([EmbyStream].self, forKey: .MediaStreams)
+        MediaSources = try c.decodeIfPresent([EmbySource].self, forKey: .MediaSources)
+        // Malformed optional artwork metadata must not break music/pagination decoding.
+        ImageTags = try? c.decode(EmbyImageTags.self, forKey: .ImageTags)
+        ChildCount = (try? c.decode(Int.self, forKey: .ChildCount)).flatMap { $0 >= 0 ? $0 : nil }
+        AlbumArtist = try? c.decode(String.self, forKey: .AlbumArtist)
+        AlbumArtists = try? c.decode([EmbyArtist].self, forKey: .AlbumArtists)
+    }
+    var primaryImageTag: String? { (ImageTags?.Primary).flatMap { EmbyAddress.validImageTag($0) ? $0 : nil } }
+    var collectionArtist: String? {
+        if let artist = AlbumArtist, !artist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return artist }
+        let names = (AlbumArtists?.compactMap(\.Name) ?? ArtistItems?.compactMap(\.Name) ?? Artists ?? [])
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        return names.isEmpty ? nil : names.joined(separator: " / ")
+    }
     func song(scope: String) -> Song? {
         guard let id = Id, EmbyAddress.validID(id),
               Type == "Audio" || (Type == nil && MediaType == "Audio") else { return nil }
@@ -184,6 +234,10 @@ enum EmbyAddress {
         !value.contains(where: { "/\\%\"\r\n".contains($0) }) &&
         value.rangeOfCharacter(from: .controlCharacters) == nil
     }
+    static func validImageTag(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 128 && value != "." && value != ".." &&
+        value.unicodeScalars.allSatisfy { segmentCharacters.contains($0) }
+    }
     static func validToken(_ value: String) -> Bool {
         !value.isEmpty && value.utf8.count <= 8192 && value.utf8.allSatisfy { (33...126).contains($0) }
     }
@@ -281,8 +335,75 @@ final class EmbyClient {
         catch let error as EmbyFailure { throw error }
         catch { if Task.isCancelled { throw CancellationError() }; throw EmbyFailure.network }
     }
+    func artwork(item: String, tag: String? = nil, token: String, user: String, pixels: Int = 320) async throws -> Data? {
+        do {
+            try Task.checkCancellation()
+            guard (try? EmbyAddress.base(base.absoluteString)) == base,
+                  EmbyAddress.validID(item), EmbyAddress.validID(user), EmbyAddress.validID(device),
+                  EmbyAddress.validToken(token), tag.map(EmbyAddress.validImageTag) != false
+            else { throw EmbyFailure.account }
+            let size = pixels <= 320 ? 320 : 700
+            var query = [URLQueryItem(name: "MaxWidth", value: String(size)),
+                         URLQueryItem(name: "MaxHeight", value: String(size)),
+                         URLQueryItem(name: "Quality", value: "90")]
+            if let tag { query.append(URLQueryItem(name: "Tag", value: tag)) }
+            let url = try EmbyAddress.endpoint(base, ["Items", item, "Images", "Primary"], query)
+            var request = URLRequest(url: url)
+            request.httpShouldHandleCookies = false
+            request.setValue("Emby Client=\"TingFlow\", Device=\"iOS\", DeviceId=\"\(device)\", Version=\"0.1\", UserId=\"\(user)\"", forHTTPHeaderField: "X-Emby-Authorization")
+            request.setValue(token, forHTTPHeaderField: "X-Emby-Token")
+            request.setValue(EmbyArtworkBody.accept, forHTTPHeaderField: "Accept")
+            let (bytes, response) = try await session.bytes(for: request)
+            defer { bytes.task.cancel() } // Header rejection/404/size overflow must stop the stream too.
+            guard let http = response as? HTTPURLResponse, response.url == url else { throw EmbyFailure.redirect }
+            switch http.statusCode {
+            case 200..<300: break
+            case 404: return nil
+            case 300..<400: throw EmbyFailure.redirect
+            case 401: throw EmbyFailure.unauthorized
+            case 403: throw EmbyFailure.forbidden
+            case 429: throw EmbyFailure.rateLimited
+            default: throw EmbyFailure.http(http.statusCode)
+            }
+            guard let mime = response.mimeType?.lowercased(), EmbyArtworkBody.types[mime] != nil else { throw EmbyFailure.response }
+            guard response.expectedContentLength <= Int64(EmbyArtworkBody.byteLimit) else { throw EmbyFailure.artworkLimit }
+            var data = Data()
+            for try await byte in bytes {
+                guard data.count < EmbyArtworkBody.byteLimit else { throw EmbyFailure.artworkLimit }
+                data.append(byte)
+            }
+            try Task.checkCancellation()
+            guard EmbyArtworkBody.valid(data, mime: mime) else { throw EmbyFailure.response }
+            return data
+        } catch is CancellationError { throw CancellationError() }
+        catch let error as EmbyFailure { throw error }
+        catch { if Task.isCancelled { throw CancellationError() }; throw EmbyFailure.network }
+    }
     func decode<T: Decodable>(_ type: T.Type, _ data: Data) throws -> T {
         do { return try JSONDecoder().decode(type, from: data) }
         catch { throw EmbyFailure.response }
+    }
+}
+
+private enum EmbyArtworkBody {
+    static let byteLimit = 4_000_000
+    static let types: [String: Set<String>] = [
+        "image/jpeg": ["public.jpeg"], "image/png": ["public.png"],
+        "image/webp": ["org.webmproject.webp"], "image/gif": ["com.compuserve.gif"],
+        "image/heic": ["public.heic", "public.heif"], "image/heif": ["public.heif", "public.heic"]
+    ]
+    static let accept = "image/jpeg, image/png, image/webp, image/heic, image/heif, image/gif"
+    static func valid(_ data: Data, mime: String) -> Bool {
+        guard !data.isEmpty, data.count <= byteLimit,
+              let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let type = CGImageSourceGetType(source), types[mime]?.contains(type as String) == true,
+              CGImageSourceGetCount(source) > 0,
+              CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete,
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any],
+              let width = properties[kCGImagePropertyPixelWidth as String] as? NSNumber,
+              let height = properties[kCGImagePropertyPixelHeight as String] as? NSNumber
+        else { return false }
+        let w = width.int64Value, h = height.int64Value
+        return (1...16_384).contains(w) && (1...16_384).contains(h) && w * h <= 80_000_000
     }
 }

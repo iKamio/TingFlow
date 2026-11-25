@@ -36,6 +36,7 @@ final class SubsonicStore: ObservableObject {
     private var albumHasMore = true
     private var cache: URL
     private let makeClient: (URL) -> SubsonicClient
+    private let artworkCache = ServerArtworkCache()
     private var restorationBlocked = false
 
     init(cacheDirectory: URL? = nil, clientFactory: @escaping (URL) -> SubsonicClient = { SubsonicClient(base: $0) }) {
@@ -108,7 +109,7 @@ final class SubsonicStore: ObservableObject {
     }
 
     private func beginNewSession() -> UUID {
-        generation = UUID(); client?.cancel(); client = nil; auth = nil; restoring = nil
+        generation = UUID(); artworkCache.clear(); client?.cancel(); client = nil; auth = nil; restoring = nil
         isSignedIn = false; accountName = ""; scopeID = nil
         albums = []; playlists = []; songs = []; errorMessage = nil; isLoading = false
         restorationBlocked = true
@@ -127,6 +128,7 @@ final class SubsonicStore: ObservableObject {
 
     func refresh() async {
         guard let context = auth, !isLoading else { return }
+        artworkCache.clear()
         isLoading = true; errorMessage = nil
         do {
             let albumResponse = try await context.client.request("getAlbumList2", credential: context.credential,
@@ -182,6 +184,47 @@ final class SubsonicStore: ObservableObject {
         }
     }
 
+    func artwork(for album: SubsonicAlbum, pixels: Int = 320) async throws -> Data? {
+        try await collectionArtwork(id: album.id, revision: album.coverArtID, scope: album.accountScope, playlist: false, pixels: pixels)
+    }
+    func artwork(for playlist: SubsonicPlaylist, pixels: Int = 320) async throws -> Data? {
+        try await collectionArtwork(id: playlist.id, revision: playlist.coverArtID, scope: playlist.accountScope, playlist: true, pixels: pixels)
+    }
+    private func verifyArtwork(_ context: Context, id: String, revision: String?, scope: String, playlist: Bool) throws {
+        try current(context)
+        guard isSignedIn, scopeID == scope, scope == context.credential.scope, SubsonicPolicy.validID(id),
+              revision.map(SubsonicPolicy.validArtworkID) != false else { throw SubsonicFailure.account }
+        if playlist {
+            guard let item = playlists.first(where: { $0.id == id }), item.accountScope == scope,
+                  item.coverArtID == revision else { throw SubsonicFailure.account }
+        } else {
+            guard let item = albums.first(where: { $0.id == id }), item.accountScope == scope,
+                  item.coverArtID == revision else { throw SubsonicFailure.account }
+        }
+    }
+    private func collectionArtwork(id: String, revision: String?, scope: String, playlist: Bool, pixels: Int) async throws -> Data? {
+        let context = try context(for: scope)
+        try verifyArtwork(context, id: id, revision: revision, scope: scope, playlist: playlist)
+        guard let revision else { return nil }
+        let size = ServerArtworkCache.pixels(pixels)
+        let key = ServerArtworkCache.Key(scope: "subsonic:" + scope + (playlist ? ":playlist" : ":album"), id: id, revision: SubsonicPolicy.artworkRevision(revision), pixels: size)
+        do {
+            let data = try await artworkCache.data(for: key) { [weak self] in
+                guard let self else { throw CancellationError() }
+                try self.verifyArtwork(context, id: id, revision: revision, scope: scope, playlist: playlist)
+                let result = try await context.client.artwork(id: revision, credential: context.credential, pixels: size)
+                try self.verifyArtwork(context, id: id, revision: revision, scope: scope, playlist: playlist)
+                return result
+            }
+            try verifyArtwork(context, id: id, revision: revision, scope: scope, playlist: playlist)
+            return data
+        } catch {
+            try current(context)
+            if error is CancellationError { throw CancellationError() }
+            throw SubsonicFailure.safe(error)
+        }
+    }
+
     func tracks(in album: SubsonicAlbum) async throws -> [Song] {
         let context = try context(for: album.accountScope)
         let response = try await context.client.request("getAlbum", credential: context.credential,
@@ -224,7 +267,7 @@ final class SubsonicStore: ObservableObject {
     }
 
     func signOut() async {
-        generation = UUID(); client?.cancel(); client = nil; auth = nil; restoring = nil; restorationBlocked = true
+        generation = UUID(); artworkCache.clear(); client?.cancel(); client = nil; auth = nil; restoring = nil; restorationBlocked = true
         isSignedIn = false; accountName = ""; scopeID = nil
         albums = []; playlists = []; songs = []; isLoading = false; errorMessage = nil
         albumOffset = 0; albumHasMore = true
@@ -250,12 +293,14 @@ final class SubsonicStore: ObservableObject {
     private func album(_ record: SubsonicRecord, scope: String) -> SubsonicAlbum? {
         guard SubsonicPolicy.validID(record.id) else { return nil }
         return SubsonicAlbum(id: record.id, name: record.name ?? record.album ?? "未知专辑",
-                             artist: record.artist, accountScope: scope, coverArtID: record.coverArt)
+                             artist: record.artist, accountScope: scope,
+                             coverArtID: record.coverArt.flatMap { SubsonicPolicy.validArtworkID($0) ? $0 : nil }, songCount: record.songCount)
     }
     private func playlist(_ record: SubsonicRecord, scope: String) -> SubsonicPlaylist? {
         guard SubsonicPolicy.validID(record.id) else { return nil }
         return SubsonicPlaylist(id: record.id, name: record.name ?? "未命名歌单",
-                                artist: record.artist, accountScope: scope, coverArtID: record.coverArt)
+                                artist: record.artist, accountScope: scope,
+                             coverArtID: record.coverArt.flatMap { SubsonicPolicy.validArtworkID($0) ? $0 : nil }, songCount: record.songCount)
     }
     private func snapshotURL(_ scope: String) -> URL {
         cache.appendingPathComponent(scope.replacingOccurrences(of: ":", with: "-") + ".json")
