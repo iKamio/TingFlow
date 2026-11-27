@@ -4,6 +4,7 @@ struct ArtworkView: View {
     var url: URL?
     var corner: CGFloat = 10
     @State private var image: UIImage?
+    @State private var loadedURL: URL?
     var body: some View {
         // Only the shape participates in layout. An image's decoded dimensions
         // must never change a grid cell, including while the image is loading.
@@ -15,7 +16,7 @@ struct ArtworkView: View {
                         Image(systemName: "music.note")
                             .font(.system(size: 30, weight: .medium))
                             .foregroundStyle(.tertiary)
-                        if let image {
+                        if loadedURL == url, let image {
                             Image(uiImage: image).resizable().scaledToFill()
                                 .frame(width: geometry.size.width, height: geometry.size.height)
                                 .clipped()
@@ -26,13 +27,13 @@ struct ArtworkView: View {
                 }
             }
         .task(id: url) {
-            image = nil
+            image = nil; loadedURL = nil
             guard let url else { return }
             #if DEBUG
-            if let fixture = UIPolishFixture.image(url) { image = fixture; return }
+            if let fixture = UIPolishFixture.image(url) { image = fixture; loadedURL = url; return }
             #endif
             if let data = try? await ArtworkLoader.shared.data(url), !Task.isCancelled {
-                image = ArtworkLoader.thumbnail(data)
+                image = ArtworkLoader.thumbnail(data); loadedURL = url
             }
         }
         .clipped()

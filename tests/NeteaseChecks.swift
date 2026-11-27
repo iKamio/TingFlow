@@ -57,6 +57,11 @@ import Foundation
         }
         expect(NeteaseMapping.mediaURL("http://m1.music.126.net/a.mp3?x=1")?.absoluteString == "https://m1.music.126.net/a.mp3?x=1", "official CDN HTTPS upgrade preserves resource")
         expect(NeteaseMapping.artworkURL("http://p1.music.126.net/a.jpg")?.scheme == "https", "artwork HTTPS upgrade")
+        expect(NeteaseMapping.artworkURL("http://p7.music.163.com:80/a.jpg?param=200y200")?.absoluteString == "https://p7.music.163.com/a.jpg", "CDN shard and unsigned resize normalize to image identity")
+        expect(NeteaseMapping.artworkURL("https://p10.music.126.net/a.jpg?param=700y700")?.absoluteString == "https://p10.music.126.net/a.jpg", "new CDN shards do not lose artwork")
+        for raw in ["https://p1.music.126.net/a.jpg?param=200y200&token=x", "https://p1.music.126.net/a.jpg?param=foo", "https://p1.music.126.net.evil.invalid/a.jpg", "https://u:p@p1.music.126.net/a.jpg"] {
+            expect(NeteaseMapping.artworkURL(raw) == nil, "artwork normalization preserves origin and unsigned-query boundary")
+        }
         expect(NeteaseMapping.artworkURL("https://p1.music.126.net/a.jpg?token=fixture") == nil, "no signed artwork in metadata")
         for raw in ["http://music.163.com/a.mp3", "http://m1.music.126.net:81/a.mp3", "https://music.126.net.evil.invalid/a", "https://127.0.0.1/a", "https://u:p@m1.music.126.net/a"] {
             expect(NeteaseMapping.mediaURL(raw) == nil, "reject unsafe media URL")

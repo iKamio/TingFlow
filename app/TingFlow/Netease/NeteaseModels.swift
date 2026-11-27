@@ -87,12 +87,24 @@ enum NeteaseMapping {
         secure.port = nil
         return secure.url
     }
-    private static let artworkHosts = Set((1...6).flatMap { ["p\($0).music.126.net", "p\($0).music.163.com"] })
     static func artworkURL(_ raw: String?) -> URL? {
         guard let raw, raw.utf8.count <= 4096, raw.utf8.allSatisfy({ (0x21...0x7e).contains($0) }),
-              let url = mediaURL(raw), let host = url.host?.lowercased(), artworkHosts.contains(host),
-              url.query == nil, url.fragment == nil else { return nil }
-        return url
+              var parts = URLComponents(string: raw), parts.user == nil, parts.password == nil,
+              let host = parts.host?.lowercased(),
+              host.range(of: #"^p[0-9]+\.music\.(126\.net|163\.com)$"#, options: .regularExpression) != nil,
+              parts.fragment == nil, let scheme = parts.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              parts.port == nil || parts.port == (scheme == "http" ? 80 : 443) else { return nil }
+        parts.scheme = "https"; parts.port = nil
+        if parts.query != nil {
+            guard let items = parts.queryItems, items.count == 1, items[0].name == "param",
+                  let value = items[0].value,
+                  value.range(of: #"^[0-9]{2,4}y[0-9]{2,4}$"#, options: .regularExpression) != nil else { return nil }
+            // Keep only unsigned image identity; the public loader requests its
+            // own bounded thumbnail. Signed or arbitrary query data stays refused.
+            parts.query = nil
+        }
+        return parts.url
     }
     static func song(_ row: [String: Any], scope: String) -> Song? {
         guard let songID = id(row["id"]) else { return nil }

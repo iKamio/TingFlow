@@ -12,6 +12,13 @@ import Combine
     @Published var useSources: Bool {
         didSet { UserDefaults.standard.set(useSources, forKey: "tingflow.playback.user-sources") }
     }
+    @Published var enhancedMatch: EnhancedMatchConfiguration {
+        didSet {
+            if let data = try? JSONEncoder().encode(enhancedMatch) {
+                UserDefaults.standard.set(data, forKey: "tingflow.playback.enhanced-match")
+            }
+        }
+    }
     @Published var minimizeTabBar: Bool {
         didSet { UserDefaults.standard.set(minimizeTabBar, forKey: "tingflow.ui.minimize-tab-bar") }
     }
@@ -22,6 +29,8 @@ import Combine
         quality = AudioQuality(rawValue: UserDefaults.standard.string(forKey: Self.qualityKey) ?? "") ?? .high
         playbackMode = NeteasePlaybackMode(rawValue: UserDefaults.standard.string(forKey: "tingflow.netease.playback-mode") ?? "") ?? .nativeV1
         useSources = UserDefaults.standard.object(forKey: "tingflow.playback.user-sources") as? Bool ?? true
+        enhancedMatch = UserDefaults.standard.data(forKey: "tingflow.playback.enhanced-match")
+            .flatMap { try? JSONDecoder().decode(EnhancedMatchConfiguration.self, from: $0) } ?? EnhancedMatchConfiguration()
         minimizeTabBar = UserDefaults.standard.object(forKey: "tingflow.ui.minimize-tab-bar") as? Bool ?? true
         transitionSettings = PlaybackTransitionSettings.load()
     }

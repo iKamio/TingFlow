@@ -122,7 +122,20 @@ function run() {
     console.log('Wrote deterministic synthetic XEAPI fixture'); return;
   }
   const expected = JSON.parse(fs.readFileSync(file, 'utf8'));
-  assert.deepEqual(actual, expected, 'independent Node vector must match frozen fixture');
+  // Deflate block choices can differ between zlib versions even with the same
+  // level/header. Compare all crypto vectors exactly; compare gzip envelopes by
+  // their independently decrypted, decompressed bytes without rewriting fixtures.
+  const gzipFields = ['encryptedGzipResponse', 'encryptedOversizeGzipResponse'];
+  function withoutGzip(vector) {
+    const stable = structuredClone(vector);
+    for (const field of gzipFields) delete stable.expected[field];
+    return stable;
+  }
+  assert.deepEqual(withoutGzip(actual), withoutGzip(expected), 'independent Node crypto vector must match frozen fixture');
+  for (const field of gzipFields) {
+    const expand = vector => zlib.gunzipSync(aes(EAPI, Buffer.from(vector.expected[field], 'base64'), true));
+    assert.deepEqual(expand(actual), expand(expected), `${field}: exact decompressed plaintext must match frozen fixture`);
+  }
   assert.equal(aes(STATIC, Buffer.from(expected.expected.signedKeyResponse.data.encryptedData, 'base64'), true).toString(),
     JSON.stringify({ publicKey: expected.expected.peerPublic, version: FIXED.version, sk: FIXED.sk }));
   assert.throws(() => aes(EAPI, Buffer.from(expected.expected.invalidPaddingResponse, 'base64'), true), 'explicit invalid PKCS#7 padding');

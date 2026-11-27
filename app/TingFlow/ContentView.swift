@@ -64,6 +64,7 @@ struct ContentView: View {
                 kugouScope = kugou.accountScope
                 kugou.setForeground(scenePhase == .active)
                 library.activateScopes(Set([emby.scopeID, netease.scopeID, subsonic.scopeID, kugou.accountScope].compactMap { $0 }))
+                let matchClient = EnhancedMatchClient()
                 player.resolver = { [weak emby, weak netease, weak subsonic, weak kugou, weak sources, weak preferences] song in
                     let quality = preferences?.quality ?? .high
                     let useSources = preferences?.useSources ?? true
@@ -76,27 +77,27 @@ struct ContentView: View {
                         return try await subsonic.playback(for: song)
                     case .netease:
                         guard let netease else { throw MusicError.unsupported("请连接网易云。") }
-                        let resource: PlaybackResource
-                        do {
-                            resource = try await netease.playback(for: song, quality: quality, mode: preferences?.playbackMode ?? .nativeV1)
-                        }
-                        catch is CancellationError { throw CancellationError() }
-                        catch {
-                            try Task.checkCancellation()
-                            guard NeteasePlaybackSafety.allowsSourceFallback(after: error), useSources,
-                                  let sources, sources.hasEnabledSources else { throw error }
-                            return try await sources.resolveWithMatching(for: song, quality: quality)
-                        }
-                        // Honor an explicit parser selection, but never use it to bypass a native safety rejection.
-                        if useSources, let sources, sources.selection != .automatic {
-                            guard sources.hasEnabledSources else { throw MusicError.unsupported("所选音源当前不可用，请检查启用和授权状态。") }
-                            return try await sources.resolveWithMatching(for: song, quality: quality)
-                        }
-                        if resource.isPreview, useSources, let sources, sources.hasEnabledSources {
-                            do { return try await sources.resolveWithMatching(for: song, quality: quality) }
-                            catch { try Task.checkCancellation(); return resource }
-                        }
-                        return resource
+                        let config = preferences?.enhancedMatch ?? EnhancedMatchConfiguration()
+                        let context = netease.playbackContextID
+                        let userSource: (() async throws -> PlaybackResource)?
+                        if useSources, let sources, sources.hasEnabledSources {
+                            userSource = { try await sources.resolveWithMatching(for: song, quality: quality) }
+                        } else { userSource = nil }
+                        let match: (() async throws -> PlaybackResource)?
+                        if config.enabled {
+                            match = {
+                                try Task.checkCancellation()
+                                guard netease.playbackContextID == context, preferences?.enhancedMatch == config else { throw CancellationError() }
+                                let resource = try await matchClient.playback(for: song, configuration: config)
+                                try Task.checkCancellation()
+                                guard netease.playbackContextID == context, preferences?.enhancedMatch == config else { throw CancellationError() }
+                                return resource
+                            }
+                        } else { match = nil }
+                        return try await NeteasePlaybackResolver.resolve(
+                            native: { try await netease.playback(for: song, quality: quality, mode: preferences?.playbackMode ?? .nativeV1) },
+                            prefersUserSource: useSources && sources != nil && sources?.selection != .automatic,
+                            userSource: userSource, match: match)
                     case .kugou:
                         guard useSources, let sources, sources.hasEnabledSources else { throw MusicError.unsupported("请在账号与设置导入并启用支持酷狗的音源。无需把网易云账号交给音源。") }
                         if let scope = song.accountScope {
@@ -137,6 +138,7 @@ struct ContentView: View {
             .onChange(of: preferences.quality) { _ in player.transitionResolutionContextDidChange() }
             .onChange(of: preferences.playbackMode) { _ in player.transitionResolutionContextDidChange() }
             .onChange(of: preferences.useSources) { _ in player.transitionResolutionContextDidChange() }
+            .onChange(of: preferences.enhancedMatch) { _ in player.transitionResolutionContextDidChange() }
             .onChange(of: player.errorMessage) { value in playbackNotice = value }
             .alert("无法播放", isPresented: Binding(get: { playbackNotice != nil }, set: { if !$0 { playbackNotice = nil } })) {
                 if player.current?.platform == .netease {

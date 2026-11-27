@@ -2,6 +2,8 @@ import SwiftUI
 
 struct PlaybackSettingsView: View {
     @ObservedObject var preferences: PlaybackPreferences
+    @State private var matchAddress = ""
+    @State private var matchMessage: String?
     var body: some View {
         Form {
             Section("网易云播放模式") {
@@ -26,6 +28,39 @@ struct PlaybackSettingsView: View {
                 Text("仅运行你已信任并启用的脚本。网易云歌单与酷狗音源登录不是同一授权；没有酷狗账号不代表所有来源都失败，也不代表网易云会员能获得其它平台版权。")
                     .font(.footnote).foregroundStyle(.secondary)
                 Text("未导入音源时，只播放平台实际提供的音频。跨平台匹配失败会明确提示，不用相似歌名替换你的歌曲。")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            Section("网易云匹配服务 · api-enhanced") {
+                TextField("https://你的 API 域名", text: $matchAddress)
+                    .textContentType(.URL).keyboardType(.URL)
+                    .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    .accessibilityIdentifier("enhanced-match-address")
+                Button("保存服务地址") {
+                    var next = preferences.enhancedMatch
+                    next.address = matchAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+                    do {
+                        if next.address.isEmpty { next.enabled = false }
+                        else { _ = try next.baseURL() }
+                        preferences.enhancedMatch = next
+                        matchAddress = next.address
+                        matchMessage = next.address.isEmpty ? "已清除地址并关闭匹配。" : "地址已保存，尚未验证服务连通性。"
+                    } catch { matchMessage = EnhancedMatchFailure.address.localizedDescription }
+                }
+                Picker("匹配模块", selection: $preferences.enhancedMatch.source) {
+                    ForEach(EnhancedMatchSource.allCases) { source in Text(source.title).tag(source) }
+                }
+                Toggle("平台无完整音频时尝试匹配", isOn: Binding(
+                    get: { preferences.enhancedMatch.enabled },
+                    set: { enabled in
+                        do {
+                            if enabled { _ = try preferences.enhancedMatch.baseURL() }
+                            preferences.enhancedMatch.enabled = enabled
+                            matchMessage = nil
+                        } catch { matchMessage = EnhancedMatchFailure.address.localizedDescription }
+                    }
+                )).accessibilityIdentifier("enhanced-match-enabled")
+                if let matchMessage { Text(matchMessage).font(.footnote).foregroundStyle(.secondary) }
+                Text("仅在网易云无音频或仅有试听时使用。自动选源先尝试已启用的脚本；手动选源保持你的选择。会向你配置的服务及其音源发送歌曲 ID，不发送网易云 Cookie。匹配版本与音质由服务决定，可能失败；仅使用你有权播放的来源。")
                     .font(.footnote).foregroundStyle(.secondary)
             }
             Section("曲目过渡") {
@@ -57,6 +92,7 @@ struct PlaybackSettingsView: View {
                     .font(.footnote).foregroundStyle(.secondary)
             }
         }.navigationTitle("播放与界面")
+            .onAppear { matchAddress = preferences.enhancedMatch.address }
     }
 }
 

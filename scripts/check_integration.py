@@ -34,10 +34,15 @@ require('UIBackgroundModes:\n          - audio' in project, 'background audio de
 require('PRODUCT_BUNDLE_IDENTIFIER: com.ikamio.tingflow' in project, 'stable application identity')
 player = text('app/TingFlow/Playback/PlayerStore.swift')
 for marker in ('try audio.setCategory(.playback', 'try audio.setActive(true)',
-               'MPNowPlayingInfoCenter.default().nowPlayingInfo = info',
-               'MPRemoteCommandCenter.shared()', 'bind(center.playCommand)',
+               'nowPlayingSession.nowPlayingInfoCenter.nowPlayingInfo = info',
+               'nowPlayingSession.remoteCommandCenter', 'bind(center.playCommand)',
                'bind(center.pauseCommand)', 'bind(center.nextTrackCommand)'):
     require(marker in player, 'preserved media ownership contract: ' + marker)
+require('MPNowPlayingSession(players: [anchor])' in player and
+        'becomeActiveIfPossible(completion: nil)' in player,
+        'explicit player-associated active Now Playing session')
+require('MPNowPlayingInfoCenter.default()' not in player and 'MPRemoteCommandCenter.shared()' not in player,
+        'no mixed global/session metadata and commands')
 nav = text('ui-tests/NavigationSmokeTests.swift')
 require('testBackgroundReturnPreservesCurrentSongAndPlayerNavigation' in nav and
         'app.activate()' in nav and 'runningBackground' in nav,
@@ -45,7 +50,8 @@ require('testBackgroundReturnPreservesCurrentSongAndPlayerNavigation' in nav and
 native = text('scripts/check_native.sh')
 for filename in ('check_search_comments.py', 'SearchStoreChecks.swift', 'check_kugou.py --native',
                  'check_transitions.py', 'check_integration.py', 'PlaybackOnsetTap.swift',
-                 'SongCommentTransportChecks.swift', 'SourceImportLifecycleChecks.swift'):
+                 'SongCommentTransportChecks.swift', 'SourceImportLifecycleChecks.swift',
+                 'NowPlayingSessionChecks.swift'):
     require(filename in native, 'required native gate: ' + filename)
 workflow = text('.github/workflows/ios.yml')
 require('continue-on-error:' not in workflow, 'no weakened CI failure semantics')
