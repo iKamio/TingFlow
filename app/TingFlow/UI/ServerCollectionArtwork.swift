@@ -98,6 +98,35 @@ struct ServerCollectionInfo {
     }
 }
 
+@MainActor struct ServerCollectionTile: View {
+    let collection: ServerCollectionInfo
+    let scope: String?
+    var diagnosticLoad: (@MainActor (Int) async throws -> ServerArtworkResult)? = nil
+    var diagnosticService: ServerArtworkDiagnostic.Service? = nil
+    let load: @MainActor (Int) async throws -> Data?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            GeometryReader { geometry in
+                ServerArtworkView(key: collection.artworkKey, scope: collection.activeScope(scope),
+                                  symbol: collection.kind.symbol, pixels: 320,
+                                  size: geometry.size.width, corner: 12,
+                                  accessibilityID: collection.accessibilityID + ".artwork",
+                                  diagnosticLoad: diagnosticLoad, diagnosticService: diagnosticService, load: load)
+            }
+            .aspectRatio(1, contentMode: .fit)
+            Text(collection.title).font(.subheadline.weight(.medium)).foregroundStyle(.primary)
+                .lineLimit(2).frame(height: 38, alignment: .topLeading)
+            if let metadata = collection.metadata {
+                Text(metadata).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+    }
+}
+
 private struct ServerArtworkRequest: Hashable {
     let key: String
     let scope: String?
@@ -202,14 +231,16 @@ private enum ServerArtworkPhase: Equatable {
                     .accessibilityIdentifier(accessibilityID + ".retry")
                 }
             }
-            if showsStatus, diagnostic != nil {
-                Button("查看封面诊断") { showsDiagnostic = true }
-                    .font(.caption).frame(minWidth: 44, minHeight: 44)
-                    .buttonStyle(.borderless)
-                    .accessibilityIdentifier(accessibilityID + ".diagnostic")
-            }
         }
         .frame(width: size)
+        .contextMenu {
+            if diagnostic != nil {
+                Button { showsDiagnostic = true } label: { Label("封面诊断", systemImage: "info.circle") }
+            }
+            if phase == .failed && scope != nil {
+                Button { retry += 1 } label: { Label("重新载入封面", systemImage: "arrow.clockwise") }
+            }
+        }
         .sheet(isPresented: diagnosticPresentation) {
             if let diagnostic {
                 ServerArtworkDiagnosticView(diagnostic: diagnostic,
@@ -282,6 +313,7 @@ private enum ServerArtworkPhase: Equatable {
                diagnosticLoad: (@MainActor (Int) async throws -> ServerArtworkResult)? = nil,
                diagnosticService: ServerArtworkDiagnostic.Service? = nil,
                load: @escaping @MainActor (Int) async throws -> Data?) {
+        if request == next, phase == .loaded || phase == .missing || worker != nil { return }
         cancel()
         request = next
         guard let scope = next.scope, !scope.isEmpty else { return }

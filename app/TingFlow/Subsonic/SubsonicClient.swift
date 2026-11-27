@@ -236,6 +236,7 @@ final class SubsonicClient {
         config.httpCookieStorage = nil; config.httpShouldSetCookies = false; config.httpCookieAcceptPolicy = .never
         config.urlCache = nil; config.urlCredentialStorage = nil; config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.timeoutIntervalForRequest = 30; config.timeoutIntervalForResource = 60
+        config.httpMaximumConnectionsPerHost = 4
         session = URLSession(configuration: config, delegate: SubsonicNoRedirects(), delegateQueue: nil)
     }
     func cancel() { session.invalidateAndCancel() }
@@ -320,7 +321,7 @@ final class SubsonicClient {
                 diagnostic.issue = http.statusCode == 401 ? .authentication : (http.statusCode == 403 ? .permission : .http)
                 throw ServerArtworkDiagnosticFailure(diagnostic: diagnostic)
             }
-            guard diagnostic.mime.isImage || diagnostic.mime == .json else {
+            guard diagnostic.mime.isImage || diagnostic.mime == .binary || diagnostic.mime == .missing || diagnostic.mime == .json else {
                 diagnostic.issue = .unexpectedMIME; throw ServerArtworkDiagnosticFailure(diagnostic: diagnostic)
             }
             let limit = diagnostic.mime == .json ? 65_536 : SubsonicArtworkBody.byteLimit
@@ -404,7 +405,8 @@ private enum SubsonicArtworkBody {
         guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary) else { return .invalidContainer }
         let type = CGImageSourceGetType(source).map { $0 as String }
         diagnostic.imageFormat = ServerArtworkDiagnostic.ImageFormat.classify(type)
-        guard let type, types[mime]?.contains(type) == true,
+        let allowedTypes = types[mime] ?? ((mime == "application/octet-stream" || mime == "未提供") ? Set(types.values.flatMap { $0 }) : [])
+        guard let type, allowedTypes.contains(type),
               CGImageSourceGetCount(source) > 0,
               CGImageSourceGetStatus(source) == .statusComplete,
               CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete,

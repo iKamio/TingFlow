@@ -293,6 +293,7 @@ final class EmbyClient {
         config.httpCookieAcceptPolicy = .never; config.urlCredentialStorage = nil
         config.urlCache = nil; config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.timeoutIntervalForRequest = 30; config.timeoutIntervalForResource = 60
+        config.httpMaximumConnectionsPerHost = 4
         session = URLSession(configuration: config, delegate: EmbyNoRedirects(), delegateQueue: nil)
     }
     func cancel() { session.invalidateAndCancel() }
@@ -314,6 +315,7 @@ final class EmbyClient {
                 r.setValue("application/json", forHTTPHeaderField: "Content-Type")
             }
             let (bytes, response) = try await session.bytes(for: r)
+            defer { bytes.task.cancel() }
             guard let h = response as? HTTPURLResponse else { throw EmbyFailure.response }
             switch h.statusCode {
             case 200..<300: break
@@ -366,8 +368,8 @@ final class EmbyClient {
             default: throw EmbyFailure.http(http.statusCode)
             }
             // Validate the declared wire type, not URLResponse's possible content sniffing.
-            guard let mime = http.value(forHTTPHeaderField: "Content-Type")?.components(separatedBy: ";").first?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-                  EmbyArtworkBody.types[mime] != nil else { throw EmbyFailure.response }
+            let mime = http.value(forHTTPHeaderField: "Content-Type")?.components(separatedBy: ";").first?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+            guard EmbyArtworkBody.types[mime] != nil || mime == "application/octet-stream" || mime.isEmpty else { throw EmbyFailure.response }
             guard response.expectedContentLength <= Int64(EmbyArtworkBody.byteLimit) else { throw EmbyFailure.artworkLimit }
             var data = Data()
             for try await byte in bytes {
@@ -396,9 +398,10 @@ private enum EmbyArtworkBody {
     ]
     static let accept = "image/jpeg, image/png, image/webp, image/heic, image/heif, image/gif"
     static func valid(_ data: Data, mime: String) -> Bool {
+        let allowedTypes = types[mime] ?? ((mime == "application/octet-stream" || mime.isEmpty) ? Set(types.values.flatMap { $0 }) : [])
         guard !data.isEmpty, data.count <= byteLimit,
               let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
-              let type = CGImageSourceGetType(source), types[mime]?.contains(type as String) == true,
+              let type = CGImageSourceGetType(source), allowedTypes.contains(type as String),
               CGImageSourceGetCount(source) > 0,
               CGImageSourceGetStatus(source) == .statusComplete,
               CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete,

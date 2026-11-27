@@ -11,13 +11,26 @@ final class SubsonicStore: ObservableObject {
     @Published private(set) var songs: [Song] = []
     @Published private(set) var isLoading = false
     @Published private(set) var errorMessage: String?
+    struct Connection: Identifiable {
+        let id: String
+        let title: String
+        let subtitle: String
+    }
+    @Published private(set) var connections: [Connection] = []
+    @Published private(set) var activeConnectionID: String?
 
     private static let vaultKey = "subsonic.account.v1"
+    private static let connectionsKey = "subsonic.connections.v2"
+    private struct SavedConnections: Codable {
+        var selected: String?
+        var records: [SubsonicCredential]
+    }
     private struct Snapshot: Codable {
         let version: Int
         let scope: String
         let albums: [SubsonicAlbum]
         let playlists: [SubsonicPlaylist]
+        let updatedAt: Date?
     }
     private final class Context {
         let credential: SubsonicCredential
@@ -42,6 +55,11 @@ final class SubsonicStore: ObservableObject {
     private let makeClient: (URL) -> SubsonicClient
     private let artworkCache = ServerArtworkCache()
     private var restorationBlocked = false
+    private var savedRecords: [SubsonicCredential] = []
+    private var refreshedAt: Date?
+    private var refreshAttemptAt: Date?
+    private var trackCache: [String: (date: Date, songs: [Song])] = [:]
+    private var trackFlights: [String: (id: UUID, task: Task<[Song], Error>)] = [:]
 
     init(cacheDirectory: URL? = nil, clientFactory: @escaping (URL) -> SubsonicClient = { SubsonicClient(base: $0) }) {
         makeClient = clientFactory
@@ -53,10 +71,23 @@ final class SubsonicStore: ObservableObject {
             var directory = cache
             var values = URLResourceValues(); values.isExcludedFromBackup = true
             try directory.setResourceValues(values)
-            if let data = try SecureVault.read(key: Self.vaultKey) {
-                let record = try JSONDecoder().decode(SubsonicCredential.self, from: data)
-                guard record.valid else { throw SubsonicFailure.storage }
+            let selected: String?
+            if let data = try SecureVault.read(key: Self.connectionsKey) {
+                let saved = try JSONDecoder().decode(SavedConnections.self, from: data)
+                guard saved.records.count <= 20, saved.records.allSatisfy(\.valid),
+                      Set(saved.records.map(\.scope)).count == saved.records.count else { throw SubsonicFailure.storage }
+                savedRecords = saved.records; selected = saved.selected
+            } else if let data = try SecureVault.read(key: Self.vaultKey) {
+                let legacy = try JSONDecoder().decode(SubsonicCredential.self, from: data)
+                guard legacy.valid else { throw SubsonicFailure.storage }
+                savedRecords = [legacy]; selected = legacy.scope
+                try persistConnections(selected: selected)
+                try SecureVault.remove(key: Self.vaultKey)
+            } else { selected = nil }
+            publishConnections()
+            if let record = savedRecords.first(where: { $0.scope == selected }) ?? savedRecords.first {
                 restoring = record
+                activeConnectionID = record.scope
                 let ticket = generation
                 Task { [weak self] in await self?.restore(record, ticket: ticket) }
             }
@@ -80,7 +111,6 @@ final class SubsonicStore: ObservableObject {
     func signIn(baseURL: String, username: String, password: String, navidrome: Bool) async {
         let ticket = beginNewSession()
         do {
-            do { try SecureVault.remove(key: Self.vaultKey) } catch { throw SubsonicFailure.storage }
             let base = try SubsonicPolicy.base(baseURL)
             guard SubsonicPolicy.validUsername(username) else { throw SubsonicFailure.authentication }
             let salt = try SubsonicPolicy.salt()
@@ -90,9 +120,13 @@ final class SubsonicStore: ObservableObject {
             let response = try await http.request("ping", credential: record)
             _ = response
             try current(ticket, http: http)
-            try SecureVault.save(JSONEncoder().encode(record), key: Self.vaultKey)
+            var records = savedRecords.filter { $0.scope != record.scope }
+            guard records.count < 20 else { throw SubsonicFailure.storage }
+            records.append(record)
+            try SecureVault.save(JSONEncoder().encode(SavedConnections(selected: record.scope, records: records)), key: Self.connectionsKey)
+            savedRecords = records; publishConnections()
             activate(record, client: http, ticket: ticket)
-            await refresh()
+            await refreshIfNeeded()
         } catch {
             guard generation == ticket else { return }
             isLoading = false
@@ -109,10 +143,9 @@ final class SubsonicStore: ObservableObject {
             try current(ticket, http: http)
             activate(record, client: http, ticket: ticket)
             loadSnapshot(record.scope)
-            await refresh()
+            await refreshIfNeeded()
         } catch {
             guard generation == ticket else { return }
-            if case .authentication = SubsonicFailure.safe(error) { try? SecureVault.remove(key: Self.vaultKey) }
             http.cancel(); client = nil; isLoading = false
             if !(error is CancellationError) { errorMessage = SubsonicFailure.safe(error).localizedDescription }
         }
@@ -120,6 +153,7 @@ final class SubsonicStore: ObservableObject {
 
     private func beginNewSession() -> UUID {
         generation = UUID(); artworkCache.clear(); client?.cancel(); client = nil; auth = nil; restoring = nil
+        trackFlights.values.forEach { $0.task.cancel() }; trackFlights = [:]; trackCache = [:]; refreshedAt = nil; refreshAttemptAt = nil
         isSignedIn = false; accountName = ""; scopeID = nil
         albums = []; playlists = []; songs = []; errorMessage = nil; isLoading = false
         restorationBlocked = true
@@ -132,13 +166,14 @@ final class SubsonicStore: ObservableObject {
     private func activate(_ record: SubsonicCredential, client: SubsonicClient, ticket: UUID) {
         guard generation == ticket else { return }
         auth = Context(record, client, ticket); self.client = client; restoring = nil; restorationBlocked = false
+        activeConnectionID = record.scope
         accountName = record.username; scopeID = record.scope; isSignedIn = true
         errorMessage = nil; isLoading = false; albumOffset = 0; albumHasMore = true
     }
 
     func refresh() async {
         guard let context = auth, !isLoading else { return }
-        artworkCache.clear()
+        refreshAttemptAt = Date()
         isLoading = true; errorMessage = nil
         do {
             let albumResponse = try await context.client.request("getAlbumList2", credential: context.credential,
@@ -154,6 +189,7 @@ final class SubsonicStore: ObservableObject {
             guard let lists = playlistResponse.playlists else { throw SubsonicFailure.response }
             playlists = (lists.playlist ?? []).compactMap { playlist($0, scope: context.credential.scope) }
             songs = []
+            refreshedAt = Date(); trackCache = [:]
             saveSnapshot(context)
             isLoading = false
         } catch {
@@ -161,6 +197,44 @@ final class SubsonicStore: ObservableObject {
             isLoading = false
             if !(error is CancellationError) { errorMessage = SubsonicFailure.safe(error).localizedDescription }
         }
+    }
+
+    func refreshIfNeeded() async {
+        guard refreshedAt.map({ Date().timeIntervalSince($0) < 900 }) != true,
+              refreshAttemptAt.map({ Date().timeIntervalSince($0) < 60 }) != true else { return }
+        await refresh()
+    }
+    var canLoadMoreAlbums: Bool { albumHasMore }
+
+    func selectConnection(id: String) async {
+        guard id != activeConnectionID || !isSignedIn,
+              let record = savedRecords.first(where: { $0.scope == id }) else { return }
+        let ticket = beginNewSession()
+        refreshAttemptAt = nil
+        activeConnectionID = id; restoring = record; restorationBlocked = false
+        do { try persistConnections(selected: id) }
+        catch { errorMessage = SubsonicFailure.storage.localizedDescription }
+        await restore(record, ticket: ticket)
+    }
+
+    func removeConnection(id: String) async {
+        if activeConnectionID == id { await signOut(); return }
+        let records = savedRecords.filter { $0.scope != id }
+        do {
+            try SecureVault.save(JSONEncoder().encode(SavedConnections(selected: activeConnectionID, records: records)), key: Self.connectionsKey)
+            savedRecords = records; publishConnections()
+            try? FileManager.default.removeItem(at: snapshotURL(id))
+        } catch { errorMessage = SubsonicFailure.storage.localizedDescription }
+    }
+
+    private func publishConnections() {
+        connections = savedRecords.map {
+            Connection(id: $0.scope, title: $0.server.host ?? ($0.navidrome ? "Navidrome" : "Subsonic"),
+                       subtitle: "\($0.navidrome ? "Navidrome" : "Subsonic") · \($0.username)")
+        }
+    }
+    private func persistConnections(selected: String?) throws {
+        try SecureVault.save(JSONEncoder().encode(SavedConnections(selected: selected, records: savedRecords)), key: Self.connectionsKey)
     }
 
     private func current(_ context: Context) throws {
@@ -233,12 +307,12 @@ final class SubsonicStore: ObservableObject {
             local.issue = auth == nil ? .signedOut : .invalidContext
             throw ServerArtworkDiagnosticFailure(diagnostic: local)
         }
-        guard let revision else {
+        guard let artworkID = revision ?? (playlist ? nil : id) else {
             local.issue = .missingID
             return ServerArtworkResult(data: nil, diagnostic: local)
         }
         let size = ServerArtworkCache.pixels(pixels)
-        let key = ServerArtworkCache.Key(scope: "subsonic:" + scope + (playlist ? ":playlist" : ":album"), id: id, revision: SubsonicPolicy.artworkRevision(revision), pixels: size)
+        let key = ServerArtworkCache.Key(scope: "subsonic:" + scope + (playlist ? ":playlist" : ":album"), id: id, revision: SubsonicPolicy.artworkRevision(artworkID), pixels: size)
         // This observation belongs only to the loader started by this call.
         // Cache hits/shared flights must not reuse another request's HTTP/code.
         var observation: ServerArtworkDiagnostic?
@@ -246,7 +320,7 @@ final class SubsonicStore: ObservableObject {
             let data = try await artworkCache.data(for: key) { [weak self] in
                 guard let self else { throw CancellationError() }
                 try self.verifyArtwork(context, id: id, revision: revision, scope: scope, playlist: playlist)
-                let result = try await context.client.artworkResult(id: revision, credential: context.credential, pixels: size)
+                let result = try await context.client.artworkResult(id: artworkID, credential: context.credential, pixels: size)
                 try self.verifyArtwork(context, id: id, revision: revision, scope: scope, playlist: playlist)
                 observation = result.diagnostic
                 return result.data
@@ -271,21 +345,44 @@ final class SubsonicStore: ObservableObject {
 
     func tracks(in album: SubsonicAlbum) async throws -> [Song] {
         let context = try context(for: album.accountScope)
-        let response = try await context.client.request("getAlbum", credential: context.credential,
-                                                        parameters: [URLQueryItem(name: "id", value: album.id)])
-        try current(context)
-        guard response.album?.id == album.id else { throw SubsonicFailure.response }
-        return response.album?.song?.compactMap { $0.song(scope: context.credential.scope) } ?? []
+        return try await cachedTracks(key: "album:" + album.id, context: context) {
+            let response = try await context.client.request("getAlbum", credential: context.credential,
+                                                            parameters: [URLQueryItem(name: "id", value: album.id)])
+            guard response.album?.id == album.id else { throw SubsonicFailure.response }
+            return response.album?.song?.compactMap { $0.song(scope: context.credential.scope) } ?? []
+        }
     }
 
     func tracks(in playlist: SubsonicPlaylist) async throws -> [Song] {
         let context = try context(for: playlist.accountScope)
-        let response = try await context.client.request("getPlaylist", credential: context.credential,
-                                                        parameters: [URLQueryItem(name: "id", value: playlist.id)])
+        return try await cachedTracks(key: "playlist:" + playlist.id, context: context) {
+            let response = try await context.client.request("getPlaylist", credential: context.credential,
+                                                            parameters: [URLQueryItem(name: "id", value: playlist.id)])
+            guard response.playlist?.id == playlist.id else { throw SubsonicFailure.response }
+            return response.playlist?.entry?.compactMap { $0.song(scope: context.credential.scope) } ?? []
+        }
+    }
+
+    private func cachedTracks(key: String, context: Context,
+                              load: @escaping @MainActor () async throws -> [Song]) async throws -> [Song] {
         try current(context)
-        guard response.playlist?.id == playlist.id else { throw SubsonicFailure.response }
-        // Do not de-duplicate: playlist entry order and duplicate entries are meaningful.
-        return response.playlist?.entry?.compactMap { $0.song(scope: context.credential.scope) } ?? []
+        if let cached = trackCache[key], Date().timeIntervalSince(cached.date) < 600 { return cached.songs }
+        let flight: (id: UUID, task: Task<[Song], Error>)
+        if let existing = trackFlights[key] { flight = existing }
+        else { flight = (UUID(), Task { try await load() }); trackFlights[key] = flight }
+        do {
+            let result = try await flight.task.value
+            try current(context)
+            if trackFlights[key]?.id == flight.id {
+                trackFlights.removeValue(forKey: key)
+                if trackCache.count >= 32 { trackCache.removeAll() }
+                trackCache[key] = (Date(), result)
+            }
+            return result
+        } catch {
+            if auth === context, trackFlights[key]?.id == flight.id { trackFlights.removeValue(forKey: key) }
+            throw error
+        }
     }
 
     func search(_ query: String) async throws -> [Song] {
@@ -311,14 +408,19 @@ final class SubsonicStore: ObservableObject {
     }
 
     func signOut() async {
+        let removedScope = auth?.credential.scope ?? restoring?.scope ?? activeConnectionID
         generation = UUID(); artworkCache.clear(); client?.cancel(); client = nil; auth = nil; restoring = nil; restorationBlocked = true
+        trackFlights.values.forEach { $0.task.cancel() }; trackFlights = [:]; trackCache = [:]; refreshedAt = nil
         isSignedIn = false; accountName = ""; scopeID = nil
         albums = []; playlists = []; songs = []; isLoading = false; errorMessage = nil
         albumOffset = 0; albumHasMore = true
-        do { try SecureVault.remove(key: Self.vaultKey) }
+        savedRecords.removeAll { $0.scope == removedScope }; activeConnectionID = nil; publishConnections()
+        do { try persistConnections(selected: nil); try SecureVault.remove(key: Self.vaultKey) }
         catch { errorMessage = "本机已停止会话，但安全凭据清除失败；请解锁设备后再次退出。" }
         do {
-            if FileManager.default.fileExists(atPath: cache.path) { try FileManager.default.removeItem(at: cache) }
+            if let removedScope, FileManager.default.fileExists(atPath: snapshotURL(removedScope).path) {
+                try FileManager.default.removeItem(at: snapshotURL(removedScope))
+            }
             try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
             var url = cache; var values = URLResourceValues(); values.isExcludedFromBackup = true
             try url.setResourceValues(values)
@@ -356,11 +458,12 @@ final class SubsonicStore: ObservableObject {
         albums = saved.albums.filter { $0.accountScope == scope }
         playlists = saved.playlists.filter { $0.accountScope == scope }
         albumOffset = albums.count; albumHasMore = true
+        refreshedAt = saved.updatedAt
     }
     private func saveSnapshot(_ context: Context) {
         guard auth === context else { return }
         let snapshot = Snapshot(version: 1, scope: context.credential.scope,
-                                albums: albums, playlists: playlists)
+                                albums: albums, playlists: playlists, updatedAt: refreshedAt)
         do {
             let data = try JSONEncoder().encode(snapshot)
             #if os(iOS)

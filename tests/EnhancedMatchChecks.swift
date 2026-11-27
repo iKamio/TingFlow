@@ -29,11 +29,16 @@ private final class EnhancedMatchFixture: URLProtocol {
     }
     static func main() async throws {
         var config = EnhancedMatchConfiguration()
-        check(!config.enabled && config.source == .msls, "prefilled matching remains opt-in with sampled HTTPS module")
+        check(config.enabled && config.source == .automatic, "owner matching deployment is enabled with bounded automatic selection")
         check(try config.baseURL().absoluteString == "https://api-enhanced-psi-khaki.vercel.app", "owner deployment is prefilled")
+        check(config.attemptedSources == [.msls, .qijieya], "bundled automatic selection attempts at most two modules in order")
         let prefilledParts = URLComponents(url: try config.requestURL(songID: "123"), resolvingAgainstBaseURL: false)!
-        check(prefilledParts.path == "/song/url/match" && prefilledParts.queryItems?.contains(URLQueryItem(name: "source", value: "msls")) == true,
-              "prefilled request selects tested HTTPS module")
+        check(prefilledParts.path == "/song/url/match" && prefilledParts.queryItems?.contains(where: { $0.name == "source" }) == false,
+              "automatic base request leaves module selection to playback orchestration")
+        let legacy = Data(#"{"enabled":false,"address":"","source":"msls"}"#.utf8)
+        let upgraded = try JSONDecoder().decode(EnhancedMatchConfiguration.self, from: legacy)
+        check(upgraded.enabled && upgraded.address == EnhancedMatchConfiguration.bundledAddress && upgraded.source == .automatic,
+              "legacy empty default is migrated once")
         let saved = EnhancedMatchConfiguration(enabled: true, address: "https://custom.example.invalid/api", source: .unm)
         check(try JSONDecoder().decode(EnhancedMatchConfiguration.self, from: JSONEncoder().encode(saved)) == saved,
               "saved custom service and choice override defaults")

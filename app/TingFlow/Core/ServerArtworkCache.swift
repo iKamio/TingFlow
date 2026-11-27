@@ -69,6 +69,7 @@ import Foundation
     private var order: [Key] = [] // Oldest first; bounded to 64.
     private var storedBytes = 0
     private var flights: [Key: Flight] = [:]
+    private var activeLoads = 0
 
     public init(byteLimit: Int = 12_000_000, entryLimit: Int = 64,
                 missingTTL: TimeInterval = 60, now: @escaping () -> Date = { Date() }) {
@@ -153,6 +154,13 @@ import Foundation
             let result: Result<Data?, Error>
             do {
                 try Task.checkCancellation()
+                while let self, self.activeLoads >= 4 {
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                    try Task.checkCancellation()
+                }
+                guard let self else { throw CancellationError() }
+                self.activeLoads += 1
+                defer { self.activeLoads -= 1 }
                 let data = try await load()
                 try Task.checkCancellation()
                 if let data = data, data.isEmpty || data.count > 4_000_000 {

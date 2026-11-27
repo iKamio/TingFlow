@@ -10,7 +10,7 @@ settings:
     TARGETED_DEVICE_FAMILY: '1,2'
     CODE_SIGNING_ALLOWED: NO
     MARKETING_VERSION: '0.6.0'
-    CURRENT_PROJECT_VERSION: '25'
+    CURRENT_PROJECT_VERSION: '26'
     ENABLE_USER_SCRIPT_SANDBOXING: YES
 targets:
   TingFlow:
@@ -32,6 +32,10 @@ targets:
         CFBundleName: TingFlow
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleURLTypes:
+          - CFBundleURLName: com.ikamio.tingflow.playback
+            CFBundleURLSchemes:
+              - tingflow
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -42,7 +46,7 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         UIBackgroundModes:
           - audio
-        NSLocalNetworkUsageDescription: 连接你添加的局域网 Emby 音乐服务器。
+        NSLocalNetworkUsageDescription: 连接你添加的局域网 Emby、Navidrome 或 Subsonic 音乐服务器。
         NSPhotoLibraryAddUsageDescription: 仅在你点击保存时，将短期登录二维码添加到相册，用于同机网易云扫码。
         ITSAppUsesNonExemptEncryption: false
     settings:

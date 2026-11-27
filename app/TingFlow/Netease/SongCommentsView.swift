@@ -16,38 +16,30 @@ import SwiftUI
     }
     var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(verbatim: String(song.title.prefix(200))).font(.headline).lineLimit(2)
-                    Text(verbatim: String(song.artist.prefix(200))).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                    if let total = model.total {
-                        Text("共 \(total) 条评论").font(.subheadline).accessibilityIdentifier("song-comments-total")
-                    }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    songHeader
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(sort == .hot ? "热门评论" : "最新评论").font(.title3.bold())
+                        Spacer()
+                        if let total = model.total {
+                            Text("\(total) 条").font(.subheadline).foregroundStyle(.secondary)
+                                .accessibilityLabel("共 \(total) 条评论")
+                                .accessibilityIdentifier("song-comments-total")
+                        }
+                    }.padding(.top, 8)
                     Picker("评论排序", selection: $sort) {
                         ForEach(CommentSort.allCases) { value in Text(value.title).tag(value) }
                     }.pickerStyle(.segmented).accessibilityIdentifier("song-comments-sort")
-                    Text("仅供浏览；不支持发布、点赞或回复。").font(.caption).foregroundStyle(.secondary)
-                }.padding()
-                List {
                     ForEach(model.comments) { comment in
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack(alignment: .firstTextBaseline) {
-                                Text(verbatim: comment.nickname).font(.subheadline.weight(.semibold))
-                                Spacer()
-                                Label("\(comment.likes)", systemImage: "heart").font(.caption).foregroundStyle(.secondary)
-                            }
-                            Text(verbatim: comment.content).font(.body).textSelection(.enabled)
-                            if let quote = comment.quote {
-                                Text(verbatim: quote).font(.callout).foregroundStyle(.secondary)
-                                    .padding(.leading, 10).accessibilityLabel("引用：" + quote)
-                            }
-                            if let time = comment.time { Text(time, style: .date).font(.caption2).foregroundStyle(.secondary) }
-                        }.padding(.vertical, 6).accessibilityElement(children: .contain)
-                            .accessibilityIdentifier("song-comment-" + comment.id)
+                        SongCommentRow(comment: comment)
                     }
                     status
-                }.listStyle(.plain).accessibilityIdentifier("song-comments-list")
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.vertical, 20)
+                }.padding(20).accessibilityIdentifier("song-comments-list")
             }
+            .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("歌曲评论").navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) {
                 Button("完成") { model.cancel(clear: true); dismiss() }.accessibilityIdentifier("song-comments-close")
@@ -67,6 +59,17 @@ import SwiftUI
         }
         .onDisappear { model.cancel(clear: true) }
         .onChange(of: scenePhase) { if $0 != .active { model.cancel() } }
+    }
+    private var songHeader: some View {
+        HStack(spacing: 14) {
+            ArtworkView(url: song.displayArtworkURL, corner: 12).frame(width: 64, height: 64)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(verbatim: String(song.title.prefix(200))).font(.headline).lineLimit(2)
+                Text(verbatim: String(song.artist.prefix(200))).font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
+            }
+            Spacer(minLength: 0)
+        }.padding(16)
+            .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
     }
     @ViewBuilder private var status: some View {
         switch model.state {
@@ -89,6 +92,44 @@ import SwiftUI
                     .accessibilityIdentifier("song-comments-more")
             }
         }
+    }
+}
+
+private struct SongCommentRow: View {
+    let comment: SongComment
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 10) {
+                Text(String(comment.nickname.prefix(1)))
+                    .font(.subheadline.weight(.semibold)).foregroundStyle(.pink)
+                    .frame(width: 36, height: 36)
+                    .background(Color.pink.opacity(0.09), in: Circle())
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(verbatim: comment.nickname).font(.subheadline.weight(.semibold)).lineLimit(2)
+                    if let time = comment.time {
+                        Text(time, style: .date).font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 4)
+                Label("\(comment.likes)", systemImage: "heart")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize()
+                    .accessibilityLabel("\(comment.likes) 次赞")
+            }
+            Text(verbatim: comment.content).font(.body).lineSpacing(4)
+                .frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled)
+            if let quote = comment.quote {
+                HStack(alignment: .top, spacing: 10) {
+                    RoundedRectangle(cornerRadius: 2).fill(Color.pink.opacity(0.3)).frame(width: 3)
+                    Text(verbatim: quote).font(.callout).foregroundStyle(.secondary).lineSpacing(3)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }.fixedSize(horizontal: false, vertical: true)
+                    .accessibilityElement(children: .ignore).accessibilityLabel("引用：" + quote)
+            }
+        }.padding(16)
+            .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("song-comment-" + comment.id)
     }
 }
 

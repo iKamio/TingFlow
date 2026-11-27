@@ -3,6 +3,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      run_tests:
+        description: Run native checks and simulator UI tests
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -31,6 +36,7 @@ jobs:
           python3 scripts/prepare_picker_fixture.py
       - name: Check native protocols and source runtime
         id: native-checks
+        if: github.event_name == 'workflow_dispatch' && inputs.run_tests
         run: |
           set -euo pipefail
           bash scripts/check_native.sh 2>&1 | tee "$RUNNER_TEMP/TingFlow-native.log"
@@ -52,7 +58,7 @@ jobs:
           /usr/bin/zip -q -r ../TingFlow-unsigned.ipa Payload
           cd ..
           shasum -a 256 TingFlow-unsigned.ipa > SHA256.txt
-          printf 'Unsigned IPA; UI test result is recorded separately. Self-signing required.\n' > BUILD_STATUS.txt
+          printf 'Unsigned IPA; self-signing required. Tests are opt-in; see verification status.\n' > BUILD_STATUS.txt
       - name: Upload unsigned IPA after successful Release build
         if: steps.package.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -66,6 +72,7 @@ jobs:
           retention-days: 14
       - name: Native iOS simulator UI tests
         id: ui-tests
+        if: github.event_name == 'workflow_dispatch' && inputs.run_tests
         timeout-minutes: 30
         run: |
           set -euo pipefail

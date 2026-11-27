@@ -23,6 +23,7 @@ struct ContentView: View {
     @State private var kugouScope: String?
     @State private var playbackNotice: String?
     @State private var showPlaybackSettings = false
+    @State private var returnToPlayer = false
 
     var body: some View {
         tabs
@@ -149,13 +150,15 @@ struct ContentView: View {
             .sheet(isPresented: $showPlaybackSettings) {
                 NavigationStack {
                     PlaybackSettingsView(preferences: preferences)
+                        .environmentObject(netease)
                         .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { showPlaybackSettings = false } } }
-                        .safeAreaInset(edge: .bottom) {
-                            if let diagnostic = netease.playbackDiagnostic {
-                                ScrollView { Text(diagnostic).font(.caption.monospaced()).textSelection(.enabled).padding() }.frame(maxHeight: 180)
-                            }
-                        }
                 }
+            }
+            .onOpenURL { url in
+                guard url.scheme?.lowercased() == "tingflow", url.host == "now-playing",
+                      player.current != nil else { return }
+                showAccounts = false; showPlaybackSettings = false
+                showPlayer = true
             }
             .onChange(of: emby.scopeID) { value in
                 clearScope(embyScope, new: value, platform: .emby); embyScope = value
@@ -175,7 +178,14 @@ struct ContentView: View {
                     #if DEBUG
                     if UIPolishFixture.enabled { return }
                     #endif
+                    player.restoreSystemPlaybackOwnership()
+                    if returnToPlayer, player.current != nil, !showAccounts, !showPlaybackSettings {
+                        showPlayer = true
+                    }
+                    returnToPlayer = false
                     Task { await kugou.restore() }
+                } else if phase == .background {
+                    returnToPlayer = player.current != nil && (player.isPlaying || player.isLoading)
                 }
             }
     }
@@ -228,7 +238,7 @@ struct ContentView: View {
         library.activateScopes(Set([emby.scopeID, netease.scopeID, subsonic.scopeID, kugou.accountScope].compactMap { $0 }))
         guard let old, old != new else { return }
         if player.queue.contains(where: { $0.platform == platform }) { player.stop() }
-        library.removeAccountScope(old)
+        if platform != .emby && platform != .subsonic { library.removeAccountScope(old) }
         search.clear()
     }
 }

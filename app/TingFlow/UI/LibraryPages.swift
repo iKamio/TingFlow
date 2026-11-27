@@ -127,7 +127,7 @@ struct MusicLibraryView: View {
     private func libraryLabel(_ title: String, symbol: String) -> some View {
         Label { Text(title).font(.body.weight(.medium)) } icon: {
             Image(systemName: symbol).font(.title3).foregroundStyle(.pink).frame(width: 30)
-        }.frame(minHeight: 38).padding(.vertical, 7)
+        }.frame(minHeight: 34).padding(.vertical, 3)
     }
     private var playlistPage: some View {
         List {
@@ -179,7 +179,7 @@ struct AccountSettingsView: View {
                 NavigationLink { SubsonicAccountView(store: subsonic, navidrome: false) } label: {
                     Label("Subsonic 兼容服务器", systemImage: "server.rack")
                 }
-                Text("Navidrome 使用 Subsonic 兼容协议。本版可同时连接 Emby 和一个兼容协议账号；不会混用两种服务的凭据。")
+                Text("Navidrome 使用 Subsonic 兼容协议。在对应服务中保存并切换服务器，各连接的凭据独立保存。")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("自定义音源") {
@@ -193,7 +193,7 @@ struct AccountSettingsView: View {
                 }
             }
             Section("播放体验") {
-                NavigationLink { PlaybackSettingsView(preferences: preferences) } label: { Label("音质与界面", systemImage: "waveform") }
+                NavigationLink { PlaybackSettingsView(preferences: preferences).environmentObject(netease) } label: { Label("音质与界面", systemImage: "waveform") }
                 NavigationLink { SourceSelectionView(store: sources) } label: {
                     Label("播放解析音源 · \(sources.selectionLabel)", systemImage: "arrow.trianglehead.2.clockwise.rotate.90")
                 }

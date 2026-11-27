@@ -3,13 +3,49 @@ import Foundation
 enum EnhancedMatchSource: String, Codable, CaseIterable, Identifiable {
     case automatic = "", unm, byfuns, ddyr, gdmusic, msls, oi, qijieya
     var id: String { rawValue }
-    var title: String { self == .automatic ? "自动匹配" : rawValue }
+    var title: String { self == .automatic ? "自动选择" : rawValue }
 }
 
 struct EnhancedMatchConfiguration: Codable, Equatable {
-    var enabled = false
-    var address = "https://api-enhanced-psi-khaki.vercel.app"
-    var source = EnhancedMatchSource.msls
+    static let bundledAddress = "https://api-enhanced-psi-khaki.vercel.app"
+    var enabled = true
+    var address = Self.bundledAddress
+    var source = EnhancedMatchSource.automatic
+
+    private enum CodingKeys: String, CodingKey { case schemaVersion, enabled, address, source }
+    init(enabled: Bool = true, address: String = EnhancedMatchConfiguration.bundledAddress, source: EnhancedMatchSource = .automatic) {
+        self.enabled = enabled; self.address = address; self.source = source
+    }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try values.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        address = try values.decodeIfPresent(String.self, forKey: .address) ?? Self.bundledAddress
+        source = try values.decodeIfPresent(EnhancedMatchSource.self, forKey: .source) ?? .automatic
+        // The earlier builds shipped the owner's deployment disabled or blank.
+        // Upgrade those defaults once; versioned saves preserve an explicit OFF choice.
+        if !values.contains(.schemaVersion) {
+            let previous = address.trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            if previous.isEmpty || previous == Self.bundledAddress {
+                address = Self.bundledAddress; enabled = true
+                if source == .msls || source == .automatic { source = .automatic }
+            }
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(2, forKey: .schemaVersion)
+        try values.encode(enabled, forKey: .enabled)
+        try values.encode(address, forKey: .address)
+        try values.encode(source, forKey: .source)
+    }
+
+    var attemptedSources: [EnhancedMatchSource] {
+        guard source == .automatic else { return [source] }
+        let host = (try? baseURL())?.host?.lowercased()
+        let bundledHost = URL(string: Self.bundledAddress)?.host?.lowercased()
+        return host == bundledHost ? [.msls, .qijieya] : [.automatic]
+    }
 
     func baseURL() throws -> URL {
         let value = address.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -36,7 +72,7 @@ struct EnhancedMatchConfiguration: Codable, Equatable {
 }
 
 enum EnhancedMatchFailure: LocalizedError {
-    case address, unavailable, response, network, unsafeMedia
+    case address, unavailable, response, network, unsafeMedia, rateLimited, busy, denied
     var errorDescription: String? {
         switch self {
         case .address: return "请先保存不含账号、密码、查询参数或片段的公网 HTTPS API 地址。"
@@ -44,6 +80,9 @@ enum EnhancedMatchFailure: LocalizedError {
         case .response: return "匹配接口返回格式无法识别，请确认服务支持 /song/url/match。"
         case .network: return "无法连接匹配服务，请检查服务地址与网络。"
         case .unsafeMedia: return "匹配服务没有返回可直接播放的 HTTPS 音频地址；HTTP 或重定向音源需要服务端提供支持 Range 的 HTTPS 代理。"
+        case .rateLimited: return "匹配服务请求过于频繁，已暂停请求，请稍后重试。"
+        case .busy: return "正在解析其它歌曲，请稍后再试。"
+        case .denied: return "匹配服务拒绝了请求，请检查服务设置；不会重复尝试其它模块。"
         }
     }
 }
@@ -57,28 +96,140 @@ private final class EnhancedMatchNoRedirects: NSObject, URLSessionTaskDelegate {
 
 /// Separate anonymous transport: platform login state never enters this session.
 /// No audio URLs, response bodies or server error text are persisted or logged.
-final class EnhancedMatchClient {
+actor EnhancedMatchClient {
+    private struct FailureEntry {
+        let error: EnhancedMatchFailure
+        let expiresAt: Date
+    }
+    private final class Flight {
+        let ticket = UUID()
+        var task: Task<Void, Never>?
+        var waiters: [UUID: CheckedContinuation<PlaybackResource, Error>] = [:]
+    }
     private let session: URLSession
+    private var failures: [URL: FailureEntry] = [:]
+    private var flights: [URL: Flight] = [:]
+    private var serviceCooldown: [URL: Date] = [:]
     init(configuration supplied: URLSessionConfiguration? = nil) {
         let config = supplied ?? .ephemeral
         config.httpShouldSetCookies = false; config.httpCookieStorage = nil
         config.urlCredentialStorage = nil; config.urlCache = nil
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.timeoutIntervalForRequest = 12; config.timeoutIntervalForResource = 18
+        config.httpMaximumConnectionsPerHost = 2
         session = URLSession(configuration: config, delegate: EnhancedMatchNoRedirects(), delegateQueue: nil)
     }
     deinit { session.invalidateAndCancel() }
 
     func playback(for song: Song, configuration: EnhancedMatchConfiguration) async throws -> PlaybackResource {
         guard configuration.enabled, song.platform == .netease else { throw EnhancedMatchFailure.unavailable }
-        let url = try configuration.requestURL(songID: song.platformID)
+        try Task.checkCancellation()
+        let service = try configuration.baseURL()
+        if let until = serviceCooldown[service], until > Date() { throw EnhancedMatchFailure.rateLimited }
+        var lastFailure = EnhancedMatchFailure.unavailable
+        // Keep automatic matching bounded: no fan-out and no full provider sweep.
+        for source in configuration.attemptedSources {
+            try Task.checkCancellation()
+            var selected = configuration; selected.source = source
+            let url = try selected.requestURL(songID: song.platformID)
+            do { return try await coalescedRequest(url, source: source, service: service) }
+            catch {
+                try Task.checkCancellation()
+                guard let failure = error as? EnhancedMatchFailure else { throw error }
+                switch failure {
+                case .unavailable, .unsafeMedia, .response: lastFailure = failure
+                default: throw failure
+                }
+            }
+        }
+        throw lastFailure
+    }
+
+    private func coalescedRequest(_ url: URL, source: EnhancedMatchSource, service: URL) async throws -> PlaybackResource {
+        let now = Date()
+        failures = failures.filter { $0.value.expiresAt > now }
+        serviceCooldown = serviceCooldown.filter { $0.value > now }
+        if let cached = failures[url] { throw cached.error }
+        if let until = serviceCooldown[service], until > now { throw EnhancedMatchFailure.rateLimited }
+        guard flights[url] != nil || flights.count < 4 else { throw EnhancedMatchFailure.busy }
+        let waiter = UUID()
+        let value = try await withTaskCancellationHandler(operation: {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<PlaybackResource, Error>) in
+                guard !Task.isCancelled else { continuation.resume(throwing: CancellationError()); return }
+                if let flight = flights[url] {
+                    flight.waiters[waiter] = continuation
+                } else {
+                    let flight = Flight()
+                    flight.waiters[waiter] = continuation; flights[url] = flight
+                    let ticket = flight.ticket
+                    flight.task = Task { [weak self] in
+                        guard let self else { return }
+                        let result: Result<PlaybackResource, Error>
+                        do {
+                            let resource = try await self.request(url, source: source)
+                            try Task.checkCancellation()
+                            result = .success(resource)
+                        } catch { result = .failure(error) }
+                        await self.finish(url, ticket: ticket, service: service, result: result)
+                    }
+                }
+            }
+        }, onCancel: {
+            Task { await self.cancel(url, waiter: waiter) }
+        })
+        try Task.checkCancellation()
+        return value
+    }
+
+    private func cancel(_ url: URL, waiter: UUID) {
+        guard let flight = flights[url], let continuation = flight.waiters.removeValue(forKey: waiter) else { return }
+        if flight.waiters.isEmpty {
+            flights.removeValue(forKey: url)
+            flight.task?.cancel(); flight.task = nil
+        }
+        continuation.resume(throwing: CancellationError())
+    }
+
+    private func finish(_ url: URL, ticket: UUID, service: URL, result: Result<PlaybackResource, Error>) {
+        guard let flight = flights[url], flight.ticket == ticket else { return }
+        flights.removeValue(forKey: url)
+        if case .failure(let error) = result, let failure = error as? EnhancedMatchFailure {
+            let duration: TimeInterval
+            switch failure {
+            case .unavailable, .unsafeMedia: duration = 90
+            case .response: duration = 30
+            case .network: duration = 15
+            case .rateLimited:
+                duration = 60
+                serviceCooldown[service] = Date().addingTimeInterval(duration)
+            case .denied: duration = 60
+            case .address, .busy: duration = 0
+            }
+            if duration > 0 {
+                if failures.count >= 64 {
+                    let oldest = failures.min { $0.value.expiresAt < $1.value.expiresAt }?.key
+                    if let oldest { failures.removeValue(forKey: oldest) }
+                }
+                failures[url] = FailureEntry(error: failure, expiresAt: Date().addingTimeInterval(duration))
+            }
+        }
+        let waiters = Array(flight.waiters.values)
+        flight.waiters.removeAll(); flight.task = nil
+        for waiter in waiters { waiter.resume(with: result) }
+    }
+
+    private func request(_ url: URL, source: EnhancedMatchSource) async throws -> PlaybackResource {
         var request = URLRequest(url: url)
         request.httpShouldHandleCookies = false
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         let data: Data
         do {
             let (bytes, response) = try await session.bytes(for: request)
+            defer { bytes.task.cancel() }
             guard let http = response as? HTTPURLResponse, http.url == url else { throw EnhancedMatchFailure.response }
+            if http.statusCode == 429 { throw EnhancedMatchFailure.rateLimited }
+            if [401, 403].contains(http.statusCode) { throw EnhancedMatchFailure.denied }
             guard http.statusCode == 200 else { throw EnhancedMatchFailure.unavailable }
             guard response.expectedContentLength <= 64_000 else { throw EnhancedMatchFailure.response }
             var body = Data()
@@ -92,13 +243,15 @@ final class EnhancedMatchClient {
             if Task.isCancelled || error is CancellationError { throw CancellationError() }
             throw (error as? EnhancedMatchFailure) ?? .network
         }
-        return try Self.resource(data, source: configuration.source)
+        return try Self.resource(data, source: source)
     }
 
-    static func resource(_ data: Data, source: EnhancedMatchSource) throws -> PlaybackResource {
+    nonisolated static func resource(_ data: Data, source: EnhancedMatchSource) throws -> PlaybackResource {
         guard data.count <= 64_000,
               let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let code = root["code"] as? Int else { throw EnhancedMatchFailure.response }
+        if code == 429 { throw EnhancedMatchFailure.rateLimited }
+        if [301, 302, 401, 403].contains(code) { throw EnhancedMatchFailure.denied }
         guard code == 200 else { throw EnhancedMatchFailure.unavailable }
         guard let direct = root["data"] as? String, !direct.isEmpty else { throw EnhancedMatchFailure.unavailable }
         // A server-provided HTTPS proxy may also resolve an upstream redirect or

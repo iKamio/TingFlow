@@ -13,12 +13,14 @@ import UIKit
         NavigationStack {
             ScrollView {
                 Text(diagnostic.text)
-                    .font(.system(.body, design: .monospaced))
+                    .font(.system(.callout, design: .monospaced))
+                    .lineSpacing(5)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding()
+                    .padding(20)
                     .accessibilityIdentifier(accessibilityID + ".summary")
             }
+            .background(Color(uiColor: .systemBackground))
             .navigationTitle("封面诊断")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -39,5 +41,7 @@ import UIKit
             .onAppear { copied = false }
             .onChange(of: diagnostic) { _ in copied = false }
         }
+        .presentationDetents([.large])
+        .presentationDragIndicator(.visible)
     }
 }

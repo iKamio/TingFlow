@@ -60,8 +60,9 @@ struct NeteasePlaybackDiagnosticView: View {
     var body: some View {
         ScrollView {
             Text(store.playbackDiagnostic ?? "尚无播放请求。请先点播一首网易云歌曲，再返回这里查看 HTTP、接口码和媒体码。")
-                .font(.system(.footnote, design: .monospaced)).textSelection(.enabled)
+                .font(.system(.footnote, design: .monospaced)).lineSpacing(5).textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading).padding()
-        }.navigationTitle("网易云播放诊断")
+        }.background(Color(uiColor: .systemBackground))
+            .navigationTitle("网易云播放诊断").navigationBarTitleDisplayMode(.inline)
     }
 }

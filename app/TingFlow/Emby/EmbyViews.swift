@@ -5,33 +5,57 @@ struct EmbyAccountView: View {
     @State private var baseURL = ""
     @State private var username = ""
     @State private var password = ""
+    @State private var addingServer = false
     var body: some View {
         Form {
+            if !store.connections.isEmpty {
+                Section("我的音乐服") {
+                    ForEach(store.connections) { connection in
+                        Button { Task { await store.selectConnection(id: connection.id) } } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: "server.rack").foregroundStyle(.tint)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(connection.title).foregroundStyle(.primary)
+                                    Text(connection.subtitle).font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if store.activeConnectionID == connection.id {
+                                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.tint)
+                                }
+                            }
+                        }.disabled(store.isLoading)
+                        .swipeActions {
+                            Button("移除", role: .destructive) { Task { await store.removeConnection(id: connection.id) } }
+                        }
+                    }
+                }
+            }
             if store.isSignedIn {
                 Section("Emby 账户") {
                     Text(store.accountName)
                     Button("刷新音乐库首批数据") { Task { await store.refresh() } }.disabled(store.isLoading)
-                    Button("退出登录", role: .destructive) { Task { await store.signOut() } }
+                    Button("移除此音乐服", role: .destructive) { Task { await store.signOut() } }
                     ForEach(EmbyLibraryKind.allCases) { kind in
                         Text("\(kind.title)：\(store.pageState(kind).progressText)").font(.caption).foregroundStyle(.secondary)
                     }
                 }
-            } else {
-                Section("连接 Emby") {
+            }
+            Section {
+                DisclosureGroup("添加 Emby 音乐服", isExpanded: Binding(get: { addingServer || store.connections.isEmpty }, set: { addingServer = $0 })) {
                     TextField("https://host/emby", text: $baseURL)
                         .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
                     TextField("用户名", text: $username).textContentType(.username)
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
                     SecureField("密码（允许为空）", text: $password).textContentType(.password)
-                    Button("登录") {
+                    Button("连接并保存") {
                         let secret = password; password = ""
                         Task { await store.signIn(baseURL: baseURL, username: username, password: secret) }
                     }.disabled(store.isLoading || baseURL.isEmpty || username.isEmpty)
                 }
-                Section {
-                    Text("使用服务器最终 HTTPS API 根地址，保留反向代理子路径。密码不保存；访问令牌仅保存在本机钥匙串。")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }
+            }
+            Section {
+                Text("可保存并切换多个 Emby 音乐服。使用最终 HTTPS 地址，密码不保存，访问令牌仅保存在本机钥匙串。音乐库按需读取，不会后台持续扫描。")
+                    .font(.footnote).foregroundStyle(.secondary)
             }
             if store.isLoading { ProgressView("正在连接…") }
             if let error = store.errorMessage { Text(error).foregroundStyle(.red) }
@@ -43,7 +67,7 @@ struct EmbyAccountView: View {
                 }
             }
         }
-        .navigationTitle("Emby 账户")
+        .navigationTitle("Emby 音乐服")
         .onDisappear { password = "" }
     }
 }
@@ -60,8 +84,17 @@ struct EmbyAccountView: View {
                 NavigationLink { EmbyAccountView(store: store) } label: {
                     Label(store.isSignedIn ? store.accountName : "连接 Emby 服务器", systemImage: "person.crop.circle")
                 }
-                Text("只读音乐库 · 每次读取最多 100 条，不要求一次加载完整库。播放队列包含你点播时已加载的曲目。")
-                    .font(.caption).foregroundStyle(.secondary)
+                if store.connections.count > 1 {
+                    Menu {
+                        ForEach(store.connections) { connection in
+                            Button { Task { await store.selectConnection(id: connection.id) } } label: {
+                                Label(connection.title + " · " + connection.subtitle,
+                                      systemImage: store.activeConnectionID == connection.id ? "checkmark" : "server.rack")
+                            }
+                        }
+                    } label: { Label("切换音乐服", systemImage: "arrow.triangle.swap") }
+                        .disabled(store.isLoading)
+                }
             }
             if let error = store.errorMessage { Text(error).foregroundStyle(.red) }
             if store.isLoading { ProgressView("加载音乐库…") }
@@ -73,12 +106,13 @@ struct EmbyAccountView: View {
         }
         .navigationTitle("Emby 音乐库")
         .refreshable { await store.refresh() }
-        .task {
-            if store.isSignedIn, !store.isLoading, !store.pageState(.songs).isLoaded { await store.refresh() }
+        .task(id: store.scopeID) {
+            if store.isSignedIn { await store.refreshIfNeeded() }
         }
     }
     private func category(_ kind: EmbyLibraryKind) -> some View {
-        List {
+        ScrollView {
+            LazyVGrid(columns: kind == .songs ? [GridItem(.flexible())] : [GridItem(.adaptive(minimum: 145), spacing: 16)], alignment: .leading, spacing: kind == .songs ? 14 : 22) {
             if store.isSignedIn {
                 if kind == .songs {
                     ForEach(Array(store.songs.enumerated()), id: \.offset) { index, song in
@@ -96,10 +130,11 @@ struct EmbyAccountView: View {
                                 try await store.tracks(in: album, cursor: cursor)
                             }
                         } label: {
-                            ServerCollectionRow(collection: collection, scope: store.isSignedIn ? store.scopeID : nil) { pixels in
+                            ServerCollectionTile(collection: collection, scope: store.isSignedIn ? store.scopeID : nil) { pixels in
                                 try await store.artwork(for: album, pixels: pixels)
                             }
                         }
+                        .buttonStyle(.plain)
                         .accessibilityIdentifier(collection.accessibilityID + ".row")
                     }
                 } else {
@@ -114,16 +149,18 @@ struct EmbyAccountView: View {
                                 try await store.tracks(in: playlist, cursor: cursor)
                             }
                         } label: {
-                            ServerCollectionRow(collection: collection, scope: store.isSignedIn ? store.scopeID : nil) { pixels in
+                            ServerCollectionTile(collection: collection, scope: store.isSignedIn ? store.scopeID : nil) { pixels in
                                 try await store.artwork(for: playlist, pixels: pixels)
                             }
                         }
+                        .buttonStyle(.plain)
                         .accessibilityIdentifier(collection.accessibilityID + ".row")
                     }
                 }
                 pagingRow(kind)
             } else { Text("请先连接 Emby。").foregroundStyle(.secondary) }
-        }.listStyle(.plain).navigationTitle(kind.title).refreshable { await store.refresh() }
+            }.padding(20)
+        }.navigationTitle(kind.title).background(Color(uiColor: .systemBackground)).refreshable { await store.refresh() }
     }
     @ViewBuilder private func pagingRow(_ kind: EmbyLibraryKind) -> some View {
         if store.isSignedIn {

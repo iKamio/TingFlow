@@ -1,9 +1,11 @@
 import SwiftUI
 
 struct PlaybackSettingsView: View {
+    @EnvironmentObject private var netease: NeteaseStore
     @ObservedObject var preferences: PlaybackPreferences
     @State private var matchAddress = ""
     @State private var matchMessage: String?
+    @State private var showDiagnostic = false
     var body: some View {
         Form {
             Section("网易云播放模式") {
@@ -30,7 +32,7 @@ struct PlaybackSettingsView: View {
                 Text("未导入音源时，只播放平台实际提供的音频。跨平台匹配失败会明确提示，不用相似歌名替换你的歌曲。")
                     .font(.footnote).foregroundStyle(.secondary)
             }
-            Section("网易云匹配服务 · api-enhanced") {
+            Section("解灰与备用音频 · api-enhanced") {
                 TextField("https://你的 API 域名", text: $matchAddress)
                     .textContentType(.URL).keyboardType(.URL)
                     .textInputAutocapitalization(.never).autocorrectionDisabled()
@@ -49,7 +51,7 @@ struct PlaybackSettingsView: View {
                 Picker("匹配模块", selection: $preferences.enhancedMatch.source) {
                     ForEach(EnhancedMatchSource.allCases) { source in Text(source.title).tag(source) }
                 }
-                Toggle("平台无完整音频时尝试匹配", isOn: Binding(
+                Toggle("启用解灰与备用匹配", isOn: Binding(
                     get: { preferences.enhancedMatch.enabled },
                     set: { enabled in
                         do {
@@ -60,7 +62,7 @@ struct PlaybackSettingsView: View {
                     }
                 )).accessibilityIdentifier("enhanced-match-enabled")
                 if let matchMessage { Text(matchMessage).font(.footnote).foregroundStyle(.secondary) }
-                Text("仅在网易云无音频或仅有试听时使用。自动选源先尝试已启用的脚本；手动选源保持你的选择。会向你配置的服务及其音源发送歌曲 ID，不发送网易云 Cookie。匹配版本与音质由服务决定，可能失败；仅使用你有权播放的来源。")
+                Text("平台无音频或仅有试听时自动尝试备用来源。内置服务的“自动选择”最多依次尝试两个模块，失败后短暂冷却。手动音源仍保持你的选择。仅发送歌曲 ID，不发送网易云 Cookie；可用性取决于服务音源，请使用你有权播放的内容。")
                     .font(.footnote).foregroundStyle(.secondary)
             }
             Section("曲目过渡") {
@@ -91,8 +93,21 @@ struct PlaybackSettingsView: View {
                 Text("iOS 26 使用系统玻璃栏与内嵌播放器变形；低版本保留原生导航。开启“减少动态效果”时不触发额外视图动画。")
                     .font(.footnote).foregroundStyle(.secondary)
             }
+            Section {
+                Button { showDiagnostic = true } label: {
+                    Label("查看播放诊断", systemImage: "waveform.path.ecg")
+                }
+            }
         }.navigationTitle("播放与界面")
             .onAppear { matchAddress = preferences.enhancedMatch.address }
+            .sheet(isPresented: $showDiagnostic) {
+                NavigationStack {
+                    NeteasePlaybackDiagnosticView(store: netease)
+                        .toolbar { ToolbarItem(placement: .confirmationAction) {
+                            Button("完成") { showDiagnostic = false }
+                        } }
+                }.presentationDetents([.large])
+            }
     }
 }
 

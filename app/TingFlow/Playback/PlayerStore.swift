@@ -39,7 +39,9 @@ final class PlayerStore: ObservableObject {
     private var listeningCycleID = UUID()
 
     private let anchorPlayer: AVPlayer
-    private let nowPlayingSession: MPNowPlayingSession
+    private let nowPlayingInfoCenter = MPNowPlayingInfoCenter.default()
+    private let remoteCommandCenter = MPRemoteCommandCenter.shared()
+    private var receivesRemoteEvents = false
     /// While an incoming deck is promoted it becomes the active AVPlayer; otherwise playback stays on anchorPlayer.
     private var player: AVPlayer { activeDeck?.player ?? anchorPlayer }
     private var generation = UUID()
@@ -88,9 +90,6 @@ final class PlayerStore: ObservableObject {
     init() {
         let anchor = AVPlayer()
         anchorPlayer = anchor
-        nowPlayingSession = MPNowPlayingSession(players: [anchor])
-        // All decks, metadata and remote commands must describe the same system session.
-        nowPlayingSession.automaticallyPublishesNowPlayingInfo = false
         observeActivePlayer()
         transitionSettingsObserver = NotificationCenter.default.addObserver(
             forName: PlaybackTransitionSettings.changed, object: nil, queue: .main
@@ -176,6 +175,7 @@ final class PlayerStore: ObservableObject {
         retire(); artwork = nil; artworkImage = nil; sourceLabel = ""; current = nil; queue = []; index = -1; order = []
         elapsed = 0; duration = 0; errorMessage = nil; qualityLabel = "原始音频"; isPreview = false
         publishMetadata()
+        if receivesRemoteEvents { UIApplication.shared.endReceivingRemoteControlEvents(); receivesRemoteEvents = false }
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
     private func rebuildOrder() {
@@ -334,11 +334,10 @@ final class PlayerStore: ObservableObject {
     }
     private func prepareTransition(_ ticket: PlaybackTransitionTicket, song: Song,
                                    resource: PlaybackResource) async {
-        var candidate: PlaybackTransitionDeck?
         defer {
-            if let candidate { removeNowPlayingPlayer(candidate.player) }
             if resolvingTicket == ticket { resolvingTicket = nil; preloadingTask = nil }
         }
+        var candidate: PlaybackTransitionDeck?
         do {
             try Task.checkCancellation()
             guard transitionTicketIsCurrent(ticket) else { return }
@@ -347,7 +346,6 @@ final class PlayerStore: ObservableObject {
             try deck.attach(resource, song: song)
             guard transitionTicketIsCurrent(ticket) else { deck.dispose(); return }
             pendingDeck = deck
-            addNowPlayingPlayer(deck.player)
             let position = player.currentTime().seconds
             let mediaDuration = player.currentItem?.duration.seconds ?? .nan
             let nominalStart = mediaDuration - PlaybackTransitionMath.boundedFade(transitionSettings.seconds)
@@ -480,7 +478,7 @@ final class PlayerStore: ObservableObject {
         pendingIncomingOffset = 0; pendingPrepared = false
         transitionStarting = false; fading = false; fadeStart = 0; fadeDuration = 0
         stopFadeTimer()
-        if let cancelledDeck { removeNowPlayingPlayer(cancelledDeck.player); cancelledDeck.dispose() }
+        cancelledDeck?.dispose()
         player.volume = 1
         transitionStatus = reason
     }
@@ -581,7 +579,7 @@ final class PlayerStore: ObservableObject {
         transitionStarting = false; fading = false; transitionStartDeadline = 0
         fadeStart = 0; fadeDuration = 0; stopFadeTimer()
         activeDeck = incoming; incoming.player.volume = 1
-        if let oldDeck { removeNowPlayingPlayer(oldDeck.player); oldDeck.dispose() }
+        oldDeck?.dispose()
         currentResource = resource
         index = ticket.targetIndex; current = song
         elapsed = PlaybackPolicy.finite(incoming.player.currentTime().seconds)
@@ -606,18 +604,15 @@ final class PlayerStore: ObservableObject {
         try audio.setActive(true)
         activateNowPlayingSession()
     }
-    private func addNowPlayingPlayer(_ player: AVPlayer) {
-        guard !nowPlayingSession.players.contains(where: { $0 === player }) else { return }
-        nowPlayingSession.addPlayer(player)
-    }
-    private func removeNowPlayingPlayer(_ player: AVPlayer) {
-        guard player !== anchorPlayer,
-              nowPlayingSession.players.contains(where: { $0 === player }) else { return }
-        nowPlayingSession.removePlayer(player)
-    }
     private func activateNowPlayingSession() {
-        guard !nowPlayingSession.isActive else { return }
-        nowPlayingSession.becomeActiveIfPossible(completion: nil)
+        guard !receivesRemoteEvents else { return }
+        UIApplication.shared.beginReceivingRemoteControlEvents()
+        receivesRemoteEvents = true
+    }
+    func restoreSystemPlaybackOwnership() {
+        guard current != nil else { return }
+        if wantsPlay { try? activate() }
+        publishMetadata()
     }
     private func resume() {
         interruptionResume = nil
@@ -704,7 +699,7 @@ final class PlayerStore: ObservableObject {
         outgoing.replaceCurrentItem(with: nil)
         loader?.invalidate(); loader = nil; currentResource = nil
         let oldDeck = activeDeck; activeDeck = nil
-        if let oldDeck { removeNowPlayingPlayer(oldDeck.player); oldDeck.dispose() }
+        oldDeck?.dispose()
         observeActivePlayer()
     }
     private func fail(_ error: PlaybackFailure) {
@@ -723,10 +718,10 @@ final class PlayerStore: ObservableObject {
         if route == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue || route == AVAudioSession.RouteChangeReason.noSuitableRouteForCategory.rawValue { pause() }
     }
     private func publishMetadata() {
-        let center = nowPlayingSession.remoteCommandCenter
+        let center = remoteCommandCenter
         for (command, _) in commands { command.isEnabled = current != nil }
         center.changePlaybackPositionCommand.isEnabled = current != nil && duration > 0 && player.currentItem?.status == .readyToPlay
-        guard let song = current else { nowPlayingSession.nowPlayingInfoCenter.nowPlayingInfo = nil; return }
+        guard let song = current else { nowPlayingInfoCenter.nowPlayingInfo = nil; return }
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: PlaybackPolicy.metadata(song.title),
             MPMediaItemPropertyArtist: PlaybackPolicy.metadata(song.artist),
@@ -734,13 +729,14 @@ final class PlayerStore: ObservableObject {
             MPMediaItemPropertyPlaybackDuration: PlaybackPolicy.finite(duration),
             MPNowPlayingInfoPropertyElapsedPlaybackTime: PlaybackPolicy.finite(elapsed),
             MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
+            MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0,
+            MPNowPlayingInfoPropertyIsLiveStream: false,
             MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.audio.rawValue
         ]
         if let artwork, artwork.identity.belongsTo(songID: song.id, url: song.displayArtworkURL) {
             info[MPMediaItemPropertyArtwork] = artwork.value
         }
-        nowPlayingSession.nowPlayingInfoCenter.nowPlayingInfo = info
-        // Activation can be refused before AVPlayer starts; retry once playback is real.
+        nowPlayingInfoCenter.nowPlayingInfo = info
         if isPlaying { activateNowPlayingSession() }
     }
     private func bind(_ command: MPRemoteCommand, _ action: @escaping @MainActor (PlayerStore) -> Void) {
@@ -751,7 +747,7 @@ final class PlayerStore: ObservableObject {
         commands.append((command, target))
     }
     private func installCommands() {
-        let center = nowPlayingSession.remoteCommandCenter
+        let center = remoteCommandCenter
         bind(center.playCommand) { $0.resume() }; bind(center.pauseCommand) { $0.pause() }
         bind(center.togglePlayPauseCommand) { $0.toggle() }; bind(center.stopCommand) { $0.stop() }
         bind(center.nextTrackCommand) { $0.next() }; bind(center.previousTrackCommand) { $0.previous() }
@@ -785,7 +781,7 @@ final class PlayerStore: ObservableObject {
         notifications.forEach { NotificationCenter.default.removeObserver($0) }
         commands.forEach { $0.0.removeTarget($0.1) }
         anchorPlayer.pause(); loader?.invalidate()
-        nowPlayingSession.nowPlayingInfoCenter.nowPlayingInfo = nil
+        nowPlayingInfoCenter.nowPlayingInfo = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 }

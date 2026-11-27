@@ -14,6 +14,13 @@ final class EmbyStore: ObservableObject {
     @Published private(set) var libraryPages: [EmbyLibraryKind: EmbyLibraryPageState] = [:]
     @Published private(set) var searchNotice: String?
     @Published private(set) var playbackDiagnostic: String?
+    struct Connection: Identifiable {
+        let id: String
+        let title: String
+        let subtitle: String
+    }
+    @Published private(set) var connections: [Connection] = []
+    @Published private(set) var activeConnectionID: String?
 
     private struct Credential: Codable {
         let base: URL; let server: String; let user: String; let name: String
@@ -30,8 +37,16 @@ final class EmbyStore: ObservableObject {
         let version: Int; let scope: String
         let songs: [Song]; let albums: [EmbyAlbum]; let playlists: [EmbyPlaylist]
         let cursors: [String: EmbyCursor]?
+        let updatedAt: Date?
     }
     private static let vaultKey = "emby.account.v1"
+    private static let connectionsKey = "emby.connections.v2"
+    private struct SavedConnections: Codable { let selected: String?; let records: [Credential] }
+    private var savedRecords: [Credential] = []
+    private var refreshedAt: Date?
+    private var refreshAttemptAt: Date?
+    private var trackCache: [String: (date: Date, batch: EmbyTrackBatch)] = [:]
+    private var trackFlights: [String: (id: UUID, task: Task<EmbyTrackBatch, Error>)] = [:]
     private var generation = UUID()
     private var refreshID = UUID()
     private var searchID = UUID()
@@ -61,13 +76,23 @@ final class EmbyStore: ObservableObject {
             var values = URLResourceValues(); values.isExcludedFromBackup = true
             try directory.setResourceValues(values)
             // Read the credential synchronously, before starting any network task.
-            if let data = try SecureVault.read(key: Self.vaultKey) {
-                let record = try JSONDecoder().decode(Credential.self, from: data)
-                guard try EmbyAddress.base(record.base.absoluteString) == record.base,
-                      EmbyAddress.validID(record.user), EmbyAddress.validID(record.server),
-                      EmbyAddress.validToken(record.token), UUID(uuidString: record.device) != nil
-                else { throw EmbyFailure.response }
+            let selected: String?
+            if let data = try SecureVault.read(key: Self.connectionsKey) {
+                let saved = try JSONDecoder().decode(SavedConnections.self, from: data)
+                guard saved.records.count <= 20, saved.records.allSatisfy(Self.validCredential),
+                      Set(saved.records.map(\.scope)).count == saved.records.count else { throw EmbyFailure.storage }
+                savedRecords = saved.records; selected = saved.selected
+            } else if let data = try SecureVault.read(key: Self.vaultKey) {
+                let legacy = try JSONDecoder().decode(Credential.self, from: data)
+                guard Self.validCredential(legacy) else { throw EmbyFailure.storage }
+                savedRecords = [legacy]; selected = legacy.scope
+                try persistConnections(selected: selected)
+                try SecureVault.remove(key: Self.vaultKey)
+            } else { selected = nil }
+            publishConnections()
+            if let record = savedRecords.first(where: { $0.scope == selected }) ?? savedRecords.first {
                 restoring = record
+                activeConnectionID = record.scope
                 let ticket = generation
                 Task { [weak self] in await self?.restore(record, ticket: ticket) }
             }
@@ -80,7 +105,7 @@ final class EmbyStore: ObservableObject {
             guard !username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw EmbyFailure.response
             }
-            guard clearLocal() else { return }
+            guard clearLocal(removeConnection: false) else { return }
             let ticket = generation
             let http = makeClient(base, device); client = http
             isLoading = true; errorMessage = nil
@@ -95,8 +120,12 @@ final class EmbyStore: ObservableObject {
                                         name: result.User?.Name ?? username, token: token, device: device)
                 try await validate(record, http: http)
                 try check(ticket, http)
-                do { try SecureVault.save(JSONEncoder().encode(record), key: Self.vaultKey) }
+                var records = savedRecords.filter { $0.scope != record.scope }
+                guard records.count < 20 else { throw EmbyFailure.storage }
+                records.append(record)
+                do { try SecureVault.save(JSONEncoder().encode(SavedConnections(selected: record.scope, records: records)), key: Self.connectionsKey) }
                 catch { throw EmbyFailure.storage }
+                savedRecords = records; publishConnections()
                 activate(record, http: http, ticket: ticket)
                 await refresh()
             } catch {
@@ -116,10 +145,10 @@ final class EmbyStore: ObservableObject {
             try await validate(record, http: http)
             try check(ticket, http)
             activate(record, http: http, ticket: ticket)
-            await refresh()
+            await refreshIfNeeded()
         } catch {
             guard generation == ticket, client === http else { return }
-            if case EmbyFailure.unauthorized = error { _ = clearLocal() }
+            if case EmbyFailure.unauthorized = error { _ = clearLocal(removeConnection: false) }
             http.cancel(); client = nil; isLoading = false
             if !(error is CancellationError) { errorMessage = safe(error).localizedDescription }
         }
@@ -135,6 +164,7 @@ final class EmbyStore: ObservableObject {
 
     private func activate(_ record: Credential, http: EmbyClient, ticket: UUID) {
         auth = Context(record, http, ticket); restoring = nil
+        activeConnectionID = record.scope
         accountName = record.name; scopeID = record.scope; isSignedIn = true
         errorMessage = nil; isLoading = false
         if let data = try? Data(contentsOf: snapshotURL(record.scope)),
@@ -143,6 +173,7 @@ final class EmbyStore: ObservableObject {
             songs = saved.songs.filter { $0.platform == .emby && $0.accountScope == record.scope }
             albums = saved.albums.filter { $0.accountScope == record.scope }
             playlists = saved.playlists.filter { $0.accountScope == record.scope }
+            refreshedAt = saved.updatedAt
             for kind in EmbyLibraryKind.allCases {
                 if let cursor = saved.cursors?[kind.rawValue] {
                     var state = EmbyLibraryPageState(); state.cursor = cursor; state.isLoaded = true
@@ -153,8 +184,9 @@ final class EmbyStore: ObservableObject {
     }
 
     func refresh() async {
-        guard let context = auth else { return }
-        artworkCache.clear()
+        guard let context = auth, !isLoading else { return }
+        refreshAttemptAt = Date()
+        trackCache = [:]
         let ticket = UUID(); refreshID = ticket; isLoading = true; errorMessage = nil
         // Only one bounded page per type. Each successful type publishes immediately.
         for kind in EmbyLibraryKind.allCases {
@@ -163,11 +195,54 @@ final class EmbyStore: ObservableObject {
         }
         if auth === context, refreshID == ticket {
             isLoading = false
+            if EmbyLibraryKind.allCases.allSatisfy({ libraryPages[$0]?.isLoaded == true && libraryPages[$0]?.error == nil }) {
+                refreshedAt = Date(); saveSnapshot(context)
+            }
             // A cancelled refresh must not leave a stale loading flag behind.
             for kind in EmbyLibraryKind.allCases {
                 if var state = libraryPages[kind], state.isLoading { state.isLoading = false; libraryPages[kind] = state }
             }
         }
+    }
+
+    func refreshIfNeeded() async {
+        guard refreshedAt.map({ Date().timeIntervalSince($0) < 900 }) != true,
+              refreshAttemptAt.map({ Date().timeIntervalSince($0) < 60 }) != true else { return }
+        await refresh()
+    }
+
+    func selectConnection(id: String) async {
+        guard id != activeConnectionID || !isSignedIn,
+              let record = savedRecords.first(where: { $0.scope == id }), clearLocal(removeConnection: false) else { return }
+        activeConnectionID = id; restoring = record
+        refreshAttemptAt = nil
+        do { try persistConnections(selected: id) }
+        catch { errorMessage = EmbyFailure.storage.localizedDescription }
+        await restore(record, ticket: generation)
+    }
+
+    func removeConnection(id: String) async {
+        if activeConnectionID == id { await signOut(); return }
+        let records = savedRecords.filter { $0.scope != id }
+        do {
+            try SecureVault.save(JSONEncoder().encode(SavedConnections(selected: activeConnectionID, records: records)), key: Self.connectionsKey)
+            savedRecords = records; publishConnections()
+            try? FileManager.default.removeItem(at: snapshotURL(id))
+        } catch { errorMessage = EmbyFailure.storage.localizedDescription }
+    }
+
+    private static func validCredential(_ record: Credential) -> Bool {
+        (try? EmbyAddress.base(record.base.absoluteString)) == record.base &&
+            EmbyAddress.validID(record.user) && EmbyAddress.validID(record.server) &&
+            EmbyAddress.validToken(record.token) && UUID(uuidString: record.device) != nil
+    }
+    private func publishConnections() {
+        connections = savedRecords.map {
+            Connection(id: $0.scope, title: $0.base.host ?? "Emby", subtitle: $0.name)
+        }
+    }
+    private func persistConnections(selected: String?) throws {
+        try SecureVault.save(JSONEncoder().encode(SavedConnections(selected: selected, records: savedRecords)), key: Self.connectionsKey)
     }
 
     func pageState(_ kind: EmbyLibraryKind) -> EmbyLibraryPageState { libraryPages[kind] ?? EmbyLibraryPageState() }
@@ -226,7 +301,7 @@ final class EmbyStore: ObservableObject {
             if Task.isCancelled || error is CancellationError {
                 state.isLoading = false; libraryPages[kind] = state; return
             }
-            if case EmbyFailure.unauthorized = error { _ = clearLocal(); errorMessage = EmbyFailure.unauthorized.localizedDescription; return }
+            if case EmbyFailure.unauthorized = error { _ = clearLocal(removeConnection: false); errorMessage = EmbyFailure.unauthorized.localizedDescription; return }
             state.isLoading = false; state.error = safe(error).localizedDescription; state.retryFromStart = reset
             libraryPages[kind] = state
             updateLibraryError()
@@ -251,7 +326,7 @@ final class EmbyStore: ObservableObject {
         })
         do {
             try JSONEncoder().encode(Snapshot(version: 2, scope: context.credential.scope, songs: songs,
-                                               albums: albums, playlists: playlists, cursors: cursors))
+                                               albums: albums, playlists: playlists, cursors: cursors, updatedAt: refreshedAt))
                 .write(to: snapshotURL(context.credential.scope), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
         } catch { errorMessage = EmbyFailure.storage.localizedDescription }
     }
@@ -316,7 +391,8 @@ final class EmbyStore: ObservableObject {
         let context = try context()
         guard album.accountScope == context.credential.scope, EmbyAddress.validID(album.id) else { throw EmbyFailure.account }
         do {
-            let batch = try await page(context, path: ["Users", context.credential.user, "Items"], query: [
+            return try await cachedTracks(key: "album:\(album.id):\(cursor.nextIndex)", context: context) {
+            let batch = try await self.page(context, path: ["Users", context.credential.user, "Items"], query: [
                 URLQueryItem(name: "Recursive", value: "true"), URLQueryItem(name: "IncludeItemTypes", value: "Audio"),
                 URLQueryItem(name: "ParentId", value: album.id),
                 URLQueryItem(name: "SortBy", value: "ParentIndexNumber,IndexNumber"),
@@ -324,6 +400,7 @@ final class EmbyStore: ObservableObject {
             ], cursor: cursor)
             return EmbyTrackBatch(songs: batch.items.compactMap { $0.song(scope: context.credential.scope) },
                                   cursor: batch.cursor, accountScope: context.credential.scope)
+            }
         } catch { throw failure(error, context) }
     }
 
@@ -331,10 +408,34 @@ final class EmbyStore: ObservableObject {
         let context = try context()
         guard playlist.accountScope == context.credential.scope, EmbyAddress.validID(playlist.id) else { throw EmbyFailure.account }
         do {
-            let batch = try await page(context, path: ["Playlists", playlist.id, "Items"], query: [], cursor: cursor, playlist: true)
+            return try await cachedTracks(key: "playlist:\(playlist.id):\(cursor.nextIndex)", context: context) {
+            let batch = try await self.page(context, path: ["Playlists", playlist.id, "Items"], query: [], cursor: cursor, playlist: true)
             return EmbyTrackBatch(songs: batch.items.compactMap { $0.song(scope: context.credential.scope) },
                                   cursor: batch.cursor, accountScope: context.credential.scope)
+            }
         } catch { throw failure(error, context) }
+    }
+
+    private func cachedTracks(key: String, context: Context,
+                              load: @escaping @MainActor () async throws -> EmbyTrackBatch) async throws -> EmbyTrackBatch {
+        try current(context)
+        if let cached = trackCache[key], Date().timeIntervalSince(cached.date) < 600 { return cached.batch }
+        let flight: (id: UUID, task: Task<EmbyTrackBatch, Error>)
+        if let existing = trackFlights[key] { flight = existing }
+        else { flight = (UUID(), Task { try await load() }); trackFlights[key] = flight }
+        do {
+            let result = try await flight.task.value
+            try current(context)
+            if trackFlights[key]?.id == flight.id {
+                trackFlights.removeValue(forKey: key)
+                if trackCache.count >= 32 { trackCache.removeAll() }
+                trackCache[key] = (Date(), result)
+            }
+            return result
+        } catch {
+            if auth === context, trackFlights[key]?.id == flight.id { trackFlights.removeValue(forKey: key) }
+            throw error
+        }
     }
 
     func playback(for song: Song) async throws -> PlaybackResource {
@@ -420,19 +521,23 @@ final class EmbyStore: ObservableObject {
         guard generation == context.generation, auth === context, !Task.isCancelled,
               !(error is CancellationError) else { return CancellationError() }
         let result = safe(error)
-        if case .unauthorized = result { _ = clearLocal() }
+        if case .unauthorized = result { _ = clearLocal(removeConnection: false) }
         errorMessage = result.localizedDescription
         return result
     }
-    @discardableResult private func clearLocal() -> Bool {
-        let scope = auth?.credential.scope ?? restoring?.scope
+    @discardableResult private func clearLocal(removeConnection: Bool = true) -> Bool {
+        let scope = auth?.credential.scope ?? restoring?.scope ?? activeConnectionID
         generation = UUID(); artworkCache.clear(); client?.cancel(); client = nil; auth = nil; restoring = nil
         isSignedIn = false; accountName = ""; scopeID = nil
         songs = []; albums = []; playlists = []; isLoading = false; errorMessage = nil
         libraryPages = [:]; searchNotice = nil; playbackDiagnostic = nil; refreshID = UUID(); searchID = UUID()
+        trackFlights.values.forEach { $0.task.cancel() }; trackFlights = [:]; trackCache = [:]; refreshedAt = nil; refreshAttemptAt = nil
         var clean = true
-        do { try SecureVault.remove(key: Self.vaultKey) } catch { clean = false }
-        if let scope, FileManager.default.fileExists(atPath: snapshotURL(scope).path) {
+        if removeConnection {
+            savedRecords.removeAll { $0.scope == scope }; activeConnectionID = nil; publishConnections()
+            do { try persistConnections(selected: nil); try SecureVault.remove(key: Self.vaultKey) } catch { clean = false }
+        }
+        if removeConnection, let scope, FileManager.default.fileExists(atPath: snapshotURL(scope).path) {
             do { try FileManager.default.removeItem(at: snapshotURL(scope)) } catch { clean = false }
         }
         if !clean { errorMessage = EmbyFailure.storage.localizedDescription }

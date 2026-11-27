@@ -49,14 +49,14 @@ struct NeteaseCoverHeader: View {
 struct NeteasePlaylistCard: View {
     let playlist: NeteasePlaylist
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 6) {
             PlaylistCover(url: playlist.coverURL, corner: 12, measurementID: "playlist-cover-\(playlist.id)")
             Text(playlist.name).font(.subheadline.weight(.medium)).foregroundStyle(.primary)
-                .lineLimit(2, reservesSpace: true)
+                .lineLimit(2)
             HStack(spacing: 4) {
                 if playlist.isPrivate { Image(systemName: "lock.fill").accessibilityLabel("私密歌单") }
                 if playlist.isLiked { Image(systemName: "heart.fill").foregroundStyle(.pink).accessibilityLabel("我喜欢的音乐") }
-                Text("\(playlist.trackCount) 首").lineLimit(1, reservesSpace: true)
+                Text("\(playlist.trackCount) 首").lineLimit(1)
             }.font(.caption).foregroundStyle(.secondary)
         }.frame(maxWidth: .infinity, alignment: .topLeading).contentShape(Rectangle())
     }
@@ -138,16 +138,16 @@ struct NeteasePageMessage: View {
   }
   var body: some View {
     ScrollView {
-      VStack(alignment: .leading, spacing: 16) {
+      VStack(alignment: .leading, spacing: 12) {
         if store.isSignedIn {
           if typeSize > .large { picker.pickerStyle(.menu) } else { picker.pickerStyle(.segmented) }
-          Text("\(playlists.count) 张歌单").font(.subheadline).foregroundStyle(.secondary)
+          Text("\(playlists.count) 张歌单").font(.caption).foregroundStyle(.secondary)
           NeteaseLoadState(title: "歌单", loading: store.isLoading, error: store.errorMessage, empty: playlists.isEmpty)
           NeteasePlaylistGrid(store: store, playlists: playlists, onPlay: onPlay)
         } else { NeteaseLoginPrompt(store: store) }
       }.padding(16)
     }
-    .id(store.scopeID).navigationTitle("我的歌单")
+    .id(store.scopeID).navigationTitle("我的歌单").navigationBarTitleDisplayMode(.inline)
     .refreshable { await store.refresh() }
     .onChange(of: store.scopeID) { _ in filter = .all }
   }
@@ -232,16 +232,10 @@ struct NeteaseLoadState: View {
     LazyVGrid(columns: typeSize.isAccessibilitySize
               ? [GridItem(.flexible(), spacing: 16, alignment: .top)]
               : [GridItem(.adaptive(minimum: typeSize > .large ? 200 : 150), spacing: 16, alignment: .top)],
-              alignment: .leading, spacing: 20) {
+              alignment: .leading, spacing: 18) {
       ForEach(Array(playlists.enumerated()), id: \.offset) { _, playlist in
         NavigationLink { NeteasePlaylistView(store: store, playlist: playlist, onPlay: onPlay) } label: {
-          VStack(alignment: .leading, spacing: 4) {
-            NeteasePlaylistCard(playlist: playlist)
-            // Keep the optional ownership line's slot even when it is absent.
-            Text(playlist.ownerID.map { $0 == store.currentUserID ? "我创建的" : "我收藏的" } ?? " ")
-              .font(.caption).foregroundStyle(.secondary).lineLimit(1, reservesSpace: true)
-              .accessibilityHidden(playlist.ownerID == nil)
-          }.frame(maxWidth: .infinity, alignment: .topLeading)
+          NeteasePlaylistCard(playlist: playlist)
         }.buttonStyle(.plain)
           .accessibilityIdentifier("playlist-card-\(playlist.id)")
       }
