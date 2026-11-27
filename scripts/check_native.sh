@@ -82,9 +82,9 @@ xcrun swiftc -swift-version 5 app/TingFlow/Core/Models.swift app/TingFlow/Core/S
 "$TMP/search-store-checks"
 python3 scripts/check_integration.py
 python3 scripts/check_kugou.py --native
-xcrun swiftc -swift-version 5 app/TingFlow/Core/Models.swift app/TingFlow/Netease/NeteaseModels.swift app/TingFlow/Netease/SongCommentModels.swift tests/SongCommentFixture.swift tests/SongCommentMappingChecks.swift -o "$TMP/song-comment-mapping-checks"
+xcrun swiftc -swift-version 5 app/TingFlow/Core/Models.swift app/TingFlow/Core/PlaybackResource.swift app/TingFlow/Netease/NeteaseModels.swift app/TingFlow/Netease/NeteaseAudioPolicy.swift app/TingFlow/Netease/NeteasePlaybackDiagnostic.swift app/TingFlow/Netease/SongCommentModels.swift tests/SongCommentFixture.swift tests/SongCommentMappingChecks.swift -o "$TMP/song-comment-mapping-checks"
 "$TMP/song-comment-mapping-checks"
-xcrun swiftc -swift-version 5 app/TingFlow/Core/Models.swift app/TingFlow/Netease/NeteaseModels.swift app/TingFlow/Netease/SongCommentModels.swift app/TingFlow/Netease/SongCommentStore.swift tests/SongCommentFixture.swift tests/SongCommentStoreChecks.swift -o "$TMP/song-comment-store-checks"
+xcrun swiftc -swift-version 5 app/TingFlow/Core/Models.swift app/TingFlow/Core/PlaybackResource.swift app/TingFlow/Netease/NeteaseModels.swift app/TingFlow/Netease/NeteaseAudioPolicy.swift app/TingFlow/Netease/NeteasePlaybackDiagnostic.swift app/TingFlow/Netease/SongCommentModels.swift app/TingFlow/Netease/SongCommentStore.swift tests/SongCommentFixture.swift tests/SongCommentStoreChecks.swift -o "$TMP/song-comment-store-checks"
 "$TMP/song-comment-store-checks"
 xcrun swiftc -swift-version 5 "${CORE[@]}" "${NCM[@]}" -lz app/TingFlow/Netease/NeteaseQRWindow.swift app/TingFlow/Netease/NeteaseStore.swift tests/SongCommentFixture.swift tests/SongCommentTransportFixture.swift tests/SongCommentTransportChecks.swift -o "$TMP/song-comment-transport-checks"
 "$TMP/song-comment-transport-checks"
