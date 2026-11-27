@@ -7,6 +7,8 @@ struct ContentView: View {
     @StateObject private var emby = EmbyStore()
     @StateObject private var netease = NeteaseStore()
     @StateObject private var subsonic = SubsonicStore()
+    @StateObject private var kugou = KugouRootStore.make()
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var sources = SourceStore()
     @StateObject private var player = PlayerStore()
     @StateObject private var preferences = PlaybackPreferences()
@@ -18,6 +20,7 @@ struct ContentView: View {
     @State private var embyScope: String?
     @State private var neteaseScope: String?
     @State private var subsonicScope: String?
+    @State private var kugouScope: String?
     @State private var playbackNotice: String?
     @State private var showPlaybackSettings = false
 
@@ -26,6 +29,7 @@ struct ContentView: View {
             .environmentObject(preferences)
             .environmentObject(netease)
             .environmentObject(subsonic)
+            .environmentObject(kugou)
             .tint(Color(red: 0.98, green: 0.18, blue: 0.33))
             .fullScreenCover(isPresented: $showPlayer) {
                 NowPlayingView(player: player, library: library, netease: netease)
@@ -37,21 +41,30 @@ struct ContentView: View {
                 NavigationStack {
                     AccountSettingsView(emby: emby, netease: netease, sources: sources, preferences: preferences)
                         .environmentObject(subsonic)
+            .environmentObject(kugou)
                         .environmentObject(preferences)
                         .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { showAccounts = false } } }
                 }
             }
             .task {
                 #if DEBUG
-                if UIPolishFixture.enabled {
+                if UIPolishFixture.enabled && !SearchPolishFixture.enabled {
                     netease.seedPolishFixture(); player.seedPolishFixture()
                     library.activateScopes([UIPolishFixture.scope])
                     return
                 }
+                if SearchPolishFixture.enabled {
+                    search.seedPolishFixture()
+                    tab = 3
+                    library.activateScopes([])
+                    return
+                }
                 #endif
                 embyScope = emby.scopeID; neteaseScope = netease.scopeID; subsonicScope = subsonic.scopeID
-                library.activateScopes(Set([emby.scopeID, netease.scopeID, subsonic.scopeID].compactMap { $0 }))
-                player.resolver = { [weak emby, weak netease, weak subsonic, weak sources, weak preferences] song in
+                kugouScope = kugou.accountScope
+                kugou.setForeground(scenePhase == .active)
+                library.activateScopes(Set([emby.scopeID, netease.scopeID, subsonic.scopeID, kugou.accountScope].compactMap { $0 }))
+                player.resolver = { [weak emby, weak netease, weak subsonic, weak kugou, weak sources, weak preferences] song in
                     let quality = preferences?.quality ?? .high
                     let useSources = preferences?.useSources ?? true
                     switch song.platform {
@@ -63,13 +76,9 @@ struct ContentView: View {
                         return try await subsonic.playback(for: song)
                     case .netease:
                         guard let netease else { throw MusicError.unsupported("请连接网易云。") }
+                        let resource: PlaybackResource
                         do {
-                            let resource = try await netease.playback(for: song, quality: quality, mode: preferences?.playbackMode ?? .nativeV1)
-                            if resource.isPreview, useSources, let sources, sources.hasEnabledSources {
-                                do { return try await sources.resolveWithMatching(for: song, quality: quality) }
-                                catch { try Task.checkCancellation(); return resource }
-                            }
-                            return resource
+                            resource = try await netease.playback(for: song, quality: quality, mode: preferences?.playbackMode ?? .nativeV1)
                         }
                         catch is CancellationError { throw CancellationError() }
                         catch {
@@ -78,9 +87,27 @@ struct ContentView: View {
                                   let sources, sources.hasEnabledSources else { throw error }
                             return try await sources.resolveWithMatching(for: song, quality: quality)
                         }
+                        // Honor an explicit parser selection, but never use it to bypass a native safety rejection.
+                        if useSources, let sources, sources.selection != .automatic {
+                            guard sources.hasEnabledSources else { throw MusicError.unsupported("所选音源当前不可用，请检查启用和授权状态。") }
+                            return try await sources.resolveWithMatching(for: song, quality: quality)
+                        }
+                        if resource.isPreview, useSources, let sources, sources.hasEnabledSources {
+                            do { return try await sources.resolveWithMatching(for: song, quality: quality) }
+                            catch { try Task.checkCancellation(); return resource }
+                        }
+                        return resource
                     case .kugou:
                         guard useSources, let sources, sources.hasEnabledSources else { throw MusicError.unsupported("请在账号与设置导入并启用支持酷狗的音源。无需把网易云账号交给音源。") }
-                        return try await sources.playback(for: song, quality: quality)
+                        if let scope = song.accountScope {
+                            guard kugou?.accountScope == scope else { throw MusicError.unsupported("酷狗账号已更改，请重新选择歌单。") }
+                        }
+                        let resource = try await sources.playback(for: song, quality: quality)
+                        try Task.checkCancellation()
+                        if let scope = song.accountScope {
+                            guard kugou?.accountScope == scope else { throw CancellationError() }
+                        }
+                        return resource
                     case .local:
                         throw MusicError.unsupported("本地音频导入尚未接入。")
                     }
@@ -97,9 +124,19 @@ struct ContentView: View {
                     guard let subsonic else { return [] }
                     return try await subsonic.search(text)
                 }
+                async let restoreKugou: Void = kugou.restore()
                 await netease.refresh()
+                await restoreKugou
             }
             .onChange(of: netease.syncPlaybackHistory) { value in player.reportsListening = value }
+            .onChange(of: sources.configurationID) { _ in player.transitionResolutionContextDidChange() }
+            .onChange(of: emby.playbackContextID) { _ in player.transitionResolutionContextDidChange() }
+            .onChange(of: netease.playbackContextID) { _ in player.transitionResolutionContextDidChange() }
+            .onChange(of: subsonic.playbackContextID) { _ in player.transitionResolutionContextDidChange() }
+            .onChange(of: kugou.playbackContextID) { _ in player.transitionResolutionContextDidChange() }
+            .onChange(of: preferences.quality) { _ in player.transitionResolutionContextDidChange() }
+            .onChange(of: preferences.playbackMode) { _ in player.transitionResolutionContextDidChange() }
+            .onChange(of: preferences.useSources) { _ in player.transitionResolutionContextDidChange() }
             .onChange(of: player.errorMessage) { value in playbackNotice = value }
             .alert("无法播放", isPresented: Binding(get: { playbackNotice != nil }, set: { if !$0 { playbackNotice = nil } })) {
                 if player.current?.platform == .netease {
@@ -126,6 +163,18 @@ struct ContentView: View {
             }
             .onChange(of: subsonic.scopeID) { value in
                 clearScope(subsonicScope, new: value, platform: .subsonic); subsonicScope = value
+            }
+            .onChange(of: kugou.accountScope) { value in
+                clearScope(kugouScope, new: value, platform: .kugou); kugouScope = value
+            }
+            .onChange(of: scenePhase) { phase in
+                kugou.setForeground(phase == .active)
+                if phase == .active {
+                    #if DEBUG
+                    if UIPolishFixture.enabled { return }
+                    #endif
+                    Task { await kugou.restore() }
+                }
             }
     }
 
@@ -156,9 +205,9 @@ struct ContentView: View {
         NavigationStack {
             Group {
                 switch index {
-                case 1: BrowseView(emby: emby, netease: netease, player: player)
+                case 1: BrowseView(library: library, emby: emby, netease: netease, player: player)
                 case 2: MusicLibraryView(library: library, emby: emby, netease: netease, player: player, sources: sources, preferences: preferences)
-                case 3: UnifiedSearchView(search: search, library: library, emby: emby, player: player)
+                case 3: UnifiedSearchView(search: search, library: library, emby: emby, player: player, sources: sources)
                 default: ListenNowView(library: library, emby: emby, netease: netease, player: player, connect: { showAccounts = true })
                 }
             }
@@ -174,7 +223,7 @@ struct ContentView: View {
         }
     }
     private func clearScope(_ old: String?, new: String?, platform: MusicPlatform) {
-        library.activateScopes(Set([emby.scopeID, netease.scopeID, subsonic.scopeID].compactMap { $0 }))
+        library.activateScopes(Set([emby.scopeID, netease.scopeID, subsonic.scopeID, kugou.accountScope].compactMap { $0 }))
         guard let old, old != new else { return }
         if player.queue.contains(where: { $0.platform == platform }) { player.stop() }
         library.removeAccountScope(old)

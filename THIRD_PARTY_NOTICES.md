@@ -9,6 +9,7 @@
 - [LX Music](https://github.com/lyswhut/lx-music-desktop) 及网易云互操作文档：只作行为与端点研究；不随项目分发上游源码、运行时包或 JS 插件。
 - [OpenSubsonic 文档](https://opensubsonic.netlify.app/docs/)：用于核对服务器 API 契约，不是代码依赖。
 - [Apple 平台 API 文档](https://developer.apple.com/documentation/)：用于 Swift/iOS 公共 API。
+- [MakcRe/KuGouMusicApi](https://github.com/MakcRe/KuGouMusicApi)：酷狗只读扫码和云歌单协议互操作参考。原生 Swift 适配器不捆绑 Node 服务；协议常量及合成签名向量参考的 MIT 许可和 Copyright (c) 2023 MakcRe 完整保留于 `app/TingFlow/Kugou/KUGOU-NOTICE.md`。无真实账号或实时兼容性验证的保证。
 
 源码只读 spot check 覆盖 `NeteaseCrypto.swift`、`CatalogClient.swift` 和 `SourceBootstrap.js`，对照本地研究快照未发现可识别的大段逐字复制；通用系统 API 调用与公开协议常量可能相同。该有限检查不是法律意见，也不替代所有历史/来源的正式代码审计。
 

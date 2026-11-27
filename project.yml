@@ -9,8 +9,8 @@ settings:
     SWIFT_VERSION: '5.0'
     TARGETED_DEVICE_FAMILY: '1,2'
     CODE_SIGNING_ALLOWED: NO
-    MARKETING_VERSION: '0.5.6'
-    CURRENT_PROJECT_VERSION: '22'
+    MARKETING_VERSION: '0.6.0'
+    CURRENT_PROJECT_VERSION: '23'
     ENABLE_USER_SCRIPT_SANDBOXING: YES
 targets:
   TingFlow:
@@ -23,6 +23,8 @@ targets:
           - '**/*.md'
     dependencies:
       - sdk: libz.tbd
+      - sdk: MediaToolbox.framework
+      - sdk: AudioToolbox.framework
     info:
       path: app/TingFlow/Info.plist
       properties:

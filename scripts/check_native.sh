@@ -1,10 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 CORE=(app/TingFlow/Core/Models.swift app/TingFlow/Core/PlaybackResource.swift app/TingFlow/Playback/ListeningSession.swift app/TingFlow/Core/ServerArtworkCache.swift app/TingFlow/Core/ServerArtworkDiagnostic.swift)
-NCM=(app/TingFlow/Netease/NeteaseModels.swift app/TingFlow/Netease/NeteaseAudioPolicy.swift app/TingFlow/Netease/NeteasePlaybackDiagnostic.swift app/TingFlow/Netease/NeteaseCloudPolicy.swift app/TingFlow/Netease/NeteaseHistoryPolicy.swift app/TingFlow/Netease/NeteaseCrypto.swift app/TingFlow/Netease/NeteaseXEAPI.swift app/TingFlow/Netease/NeteaseXEAPISession.swift app/TingFlow/Netease/NeteaseWire.swift app/TingFlow/Netease/NeteaseClient.swift)
+NCM=(app/TingFlow/Netease/NeteaseModels.swift app/TingFlow/Netease/NeteaseAudioPolicy.swift app/TingFlow/Netease/NeteasePlaybackDiagnostic.swift app/TingFlow/Netease/NeteaseCloudPolicy.swift app/TingFlow/Netease/NeteaseHistoryPolicy.swift app/TingFlow/Netease/NeteaseCrypto.swift app/TingFlow/Netease/NeteaseXEAPI.swift app/TingFlow/Netease/NeteaseXEAPISession.swift app/TingFlow/Netease/NeteaseWire.swift app/TingFlow/Netease/NeteaseClient.swift app/TingFlow/Netease/SongCommentModels.swift)
 EMBY=(app/TingFlow/Emby/EmbyClient.swift app/TingFlow/Emby/EmbyPaging.swift app/TingFlow/Emby/EmbyPlaybackDiagnostic.swift app/TingFlow/Emby/EmbyStore.swift)
-SOURCES=(app/TingFlow/Sources/SourceModels.swift app/TingFlow/Sources/SourceHTTP.swift app/TingFlow/Sources/SourceRuntime.swift app/TingFlow/Sources/SourceStore.swift)
+SOURCES=(app/TingFlow/Sources/SourceModels.swift app/TingFlow/Sources/SourceSelection.swift app/TingFlow/Sources/SourceHTTP.swift app/TingFlow/Sources/SourceRuntime.swift app/TingFlow/Sources/SourceStore.swift)
 TMP=${RUNNER_TEMP:-/tmp}
+python3 scripts/check_transitions.py
+# Unlike the pure envelope executable below, this compiles the actual MediaToolbox callbacks.
+# Release app build/link remains a separate required public Actions gate.
+IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+xcrun --sdk iphoneos swiftc -swift-version 5 -sdk "$IOS_SDK" -target arm64-apple-ios16.0 -typecheck app/TingFlow/Playback/PlaybackTransition.swift app/TingFlow/Playback/BeatTransitionAnalysis.swift app/TingFlow/Playback/PlaybackOnsetEnvelope.swift app/TingFlow/Playback/PlaybackOnsetTap.swift
 node --check app/TingFlow/Sources/SourceBootstrap.js
 xcrun swiftc -swift-version 5 app/TingFlow/Sources/SourceFileImport.swift app/TingFlow/Sources/SourceImportSession.swift tests/SourceImportLifecycleChecks.swift -o "$TMP/source-import-lifecycle-checks"
 "$TMP/source-import-lifecycle-checks"
@@ -68,3 +73,22 @@ xcrun swiftc -swift-version 5 "${CORE[@]}" "${NCM[@]}" -lz app/TingFlow/Netease/
 "$TMP/playlist-transport-checks"
 xcrun swiftc -swift-version 5 app/TingFlow/Core/Models.swift app/TingFlow/Services/ExternalMetadata.swift tests/ExternalMetadataChecks.swift -o "$TMP/external-metadata-checks"
 "$TMP/external-metadata-checks"
+xcrun swiftc -swift-version 5 app/TingFlow/Core/Models.swift app/TingFlow/Core/SearchAggregationPolicy.swift app/TingFlow/Services/CatalogArtworkMapping.swift tests/SearchPolicyChecks.swift -o "$TMP/search-policy-checks"
+"$TMP/search-policy-checks"
+xcrun swiftc -swift-version 5 app/TingFlow/Core/Models.swift app/TingFlow/Sources/SourceModels.swift app/TingFlow/Sources/SourceSelection.swift tests/SourceSelectionChecks.swift -o "$TMP/source-selection-checks"
+"$TMP/source-selection-checks"
+python3 scripts/check_search_comments.py
+xcrun swiftc -swift-version 5 app/TingFlow/Core/Models.swift app/TingFlow/Core/SearchAggregationPolicy.swift app/TingFlow/Core/Stores.swift tests/SearchStoreChecks.swift -o "$TMP/search-store-checks"
+"$TMP/search-store-checks"
+python3 scripts/check_integration.py
+python3 scripts/check_kugou.py --native
+xcrun swiftc -swift-version 5 app/TingFlow/Core/Models.swift app/TingFlow/Netease/NeteaseModels.swift app/TingFlow/Netease/SongCommentModels.swift tests/SongCommentFixture.swift tests/SongCommentMappingChecks.swift -o "$TMP/song-comment-mapping-checks"
+"$TMP/song-comment-mapping-checks"
+xcrun swiftc -swift-version 5 app/TingFlow/Core/Models.swift app/TingFlow/Netease/NeteaseModels.swift app/TingFlow/Netease/SongCommentModels.swift app/TingFlow/Netease/SongCommentStore.swift tests/SongCommentFixture.swift tests/SongCommentStoreChecks.swift -o "$TMP/song-comment-store-checks"
+"$TMP/song-comment-store-checks"
+xcrun swiftc -swift-version 5 "${CORE[@]}" "${NCM[@]}" -lz app/TingFlow/Netease/NeteaseQRWindow.swift app/TingFlow/Netease/NeteaseStore.swift tests/SongCommentFixture.swift tests/SongCommentTransportFixture.swift tests/SongCommentTransportChecks.swift -o "$TMP/song-comment-transport-checks"
+"$TMP/song-comment-transport-checks"
+xcrun swiftc -swift-version 5 app/TingFlow/Playback/PlaybackTransition.swift app/TingFlow/Playback/BeatTransitionAnalysis.swift app/TingFlow/Playback/PlaybackOnsetEnvelope.swift tests/PlaybackTransitionChecks.swift -o "$TMP/playback-transition-checks"
+"$TMP/playback-transition-checks"
+xcrun swiftc -swift-version 5 app/TingFlow/Playback/PlaybackTransition.swift app/TingFlow/Playback/BeatTransitionAnalysis.swift app/TingFlow/Playback/PlaybackOnsetEnvelope.swift tests/PlaybackOnsetTapChecks.swift -o "$TMP/playback-onset-envelope-checks"
+"$TMP/playback-onset-envelope-checks"

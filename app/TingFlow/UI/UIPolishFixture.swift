@@ -3,7 +3,10 @@ import SwiftUI
 
 /// Only compiled into simulator/debug builds. Never present in the delivered Release IPA.
 @MainActor enum UIPolishFixture {
-    static var enabled: Bool { ProcessInfo.processInfo.arguments.contains("-TingFlowPolishFixture") }
+    static var enabled: Bool {
+        let arguments = ProcessInfo.processInfo.arguments
+        return arguments.contains("-TingFlowPolishFixture") || arguments.contains("-TingFlowSearchFixture")
+    }
     static let scope = "netease:700001"
     static let covers = ["a", "b", "c", "d", "e", "f"]
     static func url(_ key: String) -> URL { URL(string: "https://p1.music.126.net/ui-test/\(key).jpg")! }
@@ -41,6 +44,20 @@ import SwiftUI
             NeteasePlaylist(id: "\(index + 100)", name: name, trackCount: 6, coverURL: index == 2 ? nil : url(covers[index]), ownerName: "听流测试账号", accountScope: scope,
                             ownerID: index < 3 ? "700001" : "700002", isPrivate: index == 0, isLiked: index == 4)
         }
+    }
+}
+#endif
+
+
+#if DEBUG
+@MainActor enum SearchPolishFixture {
+    static var enabled: Bool { ProcessInfo.processInfo.arguments.contains("-TingFlowSearchFixture") }
+    static var songs: [Song] {
+        [
+            Song(platform: .netease, platformID: "990001", title: "海风来信", artist: "听流合成测试", album: "合成封面 A", duration: 190, artworkURL: UIPolishFixture.url("a")),
+            Song(platform: .kugou, platformID: "990002", title: "夜行者", artist: "听流合成测试", album: "合成封面 B", duration: 205, artworkURL: UIPolishFixture.url("b")),
+            Song(platform: .netease, platformID: "990003", title: "蓝色时刻", artist: "听流合成测试", album: "合成封面 C", duration: 215, artworkURL: UIPolishFixture.url("c"))
+        ]
     }
 }
 #endif

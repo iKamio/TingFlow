@@ -28,6 +28,28 @@ struct PlaybackSettingsView: View {
                 Text("未导入音源时，只播放平台实际提供的音频。跨平台匹配失败会明确提示，不用相似歌名替换你的歌曲。")
                     .font(.footnote).foregroundStyle(.secondary)
             }
+            Section("曲目过渡") {
+                Picker("过渡方式", selection: Binding(
+                    get: { preferences.transitionSettings.mode },
+                    set: { preferences.transitionSettings.mode = $0 }
+                )) {
+                    ForEach(PlaybackTransitionMode.allCases) { mode in Text(mode.title).tag(mode) }
+                }.accessibilityIdentifier("playback-transition-mode")
+                Picker("淡化时长", selection: Binding(
+                    get: { PlaybackTransitionSettings.boundedSeconds(preferences.transitionSettings.seconds) },
+                    set: { preferences.transitionSettings.seconds = $0 }
+                )) {
+                    ForEach(1...8, id: \.self) { seconds in Text("\(seconds) 秒").tag(Double(seconds)) }
+                }.disabled(preferences.transitionSettings.mode == .off)
+                Picker("音量曲线", selection: Binding(
+                    get: { preferences.transitionSettings.curve },
+                    set: { preferences.transitionSettings.curve = $0 }
+                )) {
+                    ForEach(PlaybackTransitionCurve.allCases) { curve in Text(curve.title).tag(curve) }
+                }.disabled(preferences.transitionSettings.mode == .off)
+                Text("固定淡化默认 3 秒，由两个 AVPlayer 实际交叉调节音量；“本机起音对齐”只分析安全可读的本地 PCM，不推断 BPM、不拉取远程音频。远程、鉴权或样本不足时会显示固定淡化回退；直播、未知时长、短曲及单曲循环正常切歌。不是 Apple AutoMix。")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
             Section("底部导航") {
                 Toggle("滚动时收起底栏", isOn: $preferences.minimizeTabBar)
                     .accessibilityIdentifier("playback-minimize")

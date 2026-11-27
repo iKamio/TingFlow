@@ -1,0 +1,12 @@
+{
+  "code": 200,
+  "data": {
+    "totalCount": 2,
+    "hasMore": false,
+    "cursor": "1699999999000",
+    "comments": [
+      {"commentId": "9007199254740993", "content": "合成评论 <b>不是 HTML</b> https://example.invalid/", "user": {"nickname": "合成用户甲", "avatarUrl": "https://example.invalid/never-load.png"}, "likedCount": 0, "time": 1700000000000},
+      {"commentId": 42, "content": "第二条合成评论", "user": {"nickname": "合成用户乙"}, "likedCount": 2, "beReplied": [{"content": "合成引用，只读不可回复"}]}
+    ]
+  }
+}

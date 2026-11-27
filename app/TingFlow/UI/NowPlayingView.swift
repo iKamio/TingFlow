@@ -86,6 +86,7 @@ struct NowPlayingView: View {
     @State private var lyricGeneration = UUID()
     @State private var scrub: Double = 0
     @State private var scrubbing = false
+    @State private var showSongComments = false
     var body: some View {
         GeometryReader { geometry in
             Group {
@@ -105,6 +106,11 @@ struct NowPlayingView: View {
         .tint(.primary)
         .task(id: "\(player.current?.id ?? ""):\(lyricRetry)") { await loadLyrics() }
         .onChange(of: player.current?.id) { _ in scrubbing = false }
+        .sheet(isPresented: $showSongComments) {
+            if let song = player.current, song.platform == .netease {
+                SongCommentsView(song: song).environmentObject(netease)
+            }
+        }
     }
     /// Restrict pull-to-close to the header/cover, never lyric/queue scroll views or sliders.
     private var dismissGesture: some Gesture {
@@ -182,6 +188,10 @@ struct NowPlayingView: View {
             Spacer(minLength: 0)
             if let song = player.current {
                 if song.platform == .netease {
+                    Button { showSongComments = true } label: {
+                        Image(systemName: "text.bubble").font(.title3).frame(width: 40, height: 44)
+                    }.buttonStyle(.plain).accessibilityLabel("歌曲评论")
+                        .accessibilityIdentifier("song-comments-open")
                     NeteaseCloudLikeButton(store: netease, song: song)
                     NeteaseCloudSongMenu(store: netease, song: song)
                 } else {
@@ -220,6 +230,15 @@ struct NowPlayingView: View {
                     Spacer(minLength: 0)
                     Text("−" + time(max(0, player.duration - (scrubbing ? scrub : player.elapsed)))).monospacedDigit()
                 }.font(.caption).foregroundStyle(.secondary)
+            }
+            if !player.transitionStatus.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "waveform.path.ecg")
+                    Text(player.transitionStatus).lineLimit(1)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("playback-transition-status")
             }
             HStack {
                 Button { player.previous() } label: { Image(systemName: "backward.fill").font(.system(size: 30)).frame(width: 64, height: 58) }

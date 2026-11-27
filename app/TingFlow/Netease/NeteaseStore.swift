@@ -11,7 +11,12 @@ import Combine
     @Published private(set) var cloudMessage: String?
     @Published private(set) var accountName = "未登录"
     @Published private(set) var avatarURL: URL?
-    @Published private(set) var scopeID: String?
+    @Published private(set) var scopeID: String? {
+        didSet { if oldValue != scopeID { cancelCommentRequests() } }
+    }
+    // Comments never restore/save credentials or reuse a not-yet-verified login candidate.
+    private var commentRequests: [UUID: Task<SongCommentPage, Error>] = [:]
+    private let makeAnonymousCommentClient: @MainActor () -> NeteaseClient
     @Published private(set) var playlists: [NeteasePlaylist] = []
     @Published private(set) var dailySongs: [Song] = []
     @Published private(set) var dailyPlaylists: [NeteaseFeaturedPlaylist] = []
@@ -46,7 +51,11 @@ import Combine
     @Published private(set) var isAuthorizing = false
 
     private static let vaultKey = "netease.native.weapi.session.v1"
-    private var client: NeteaseClient?
+    // Replacing an authenticated client invalidates speculative playback even if scope is unchanged.
+    @Published private(set) var playbackContextID = UUID()
+    private var client: NeteaseClient? {
+        didSet { if oldValue !== client { playbackContextID = UUID() } }
+    }
     private var qrClient: NeteaseClient?
     private var qrTask: Task<Void, Never>?
     private var qrExpiryTask: Task<Void, Never>?
@@ -61,8 +70,14 @@ import Combine
     private var qrKey: String?
     var canResumeQRCode: Bool { qrClient != nil && qrWindow?.isExpired() == false }
     private var trackCache: [String: [Song]] = [:]
-    init(clientFactory: (@MainActor () -> NeteaseClient)? = nil) {
+    init(clientFactory: (@MainActor () -> NeteaseClient)? = nil,
+         anonymousCommentClientFactory: (@MainActor () -> NeteaseClient)? = nil) {
         makeClient = clientFactory ?? { NeteaseClient() }
+        makeAnonymousCommentClient = anonymousCommentClientFactory ?? {
+            // An ephemeral device identity avoids even a UserDefaults write for anonymous reading.
+            let device = (UUID().uuidString + UUID().uuidString).replacingOccurrences(of: "-", with: "")
+            return NeteaseClient(deviceID: String(device.prefix(52)))
+        }
     }
 
     func refresh() async {
@@ -308,6 +323,7 @@ import Combine
         qrStatus = ""
     }
     func signOut() async {
+        cancelCommentRequests()
         clearCloudState()
         restorationDisabled = true
         generation = UUID()
@@ -447,6 +463,48 @@ import Combine
             // Request-specific numeric refusals already travel as playbackVerification.
             // Never infer this request's error from another playback's shared diagnostic.
             throw NeteaseError.verification
+        }
+    }
+    /// Includes auth epoch, not just UID: signing back into the same account cannot revive old pages.
+    var commentContextID: String { generation.uuidString + ":" + (isSignedIn ? (scopeID ?? "unverified") : "anonymous") }
+    private func cancelCommentRequests() {
+        for task in commentRequests.values { task.cancel() }
+        commentRequests.removeAll()
+    }
+    func comments(for song: Song, sort: CommentSort, page: Int, cursor: String?) async throws -> SongCommentPage {
+        try Task.checkCancellation()
+        guard song.platform == .netease, SongCommentMapping.validID(song.platformID) else { throw NeteaseError.unavailable }
+        guard song.accountScope == nil || (isSignedIn && song.accountScope == scopeID) else { throw NeteaseError.signedOut }
+        let payload = try SongCommentMapping.payload(songID: song.platformID, sort: sort, page: page, cursor: cursor)
+        let context = commentContextID, ticket = UUID()
+        let authenticated = isSignedIn ? client : nil
+        let anonymous = authenticated == nil
+        let reader = authenticated ?? makeAnonymousCommentClient()
+        let worker = Task { @MainActor in
+            let body = try await reader.request(.comments, payload)
+            try Task.checkCancellation()
+            return try SongCommentMapping.decode(body)
+        }
+        commentRequests[ticket] = worker
+        let started = Date()
+        let deadline = Task { @MainActor in
+            do { try await Task.sleep(nanoseconds: 25_000_000_000) } catch { return }
+            worker.cancel()
+        }
+        defer {
+            deadline.cancel(); commentRequests.removeValue(forKey: ticket)
+            if anonymous { reader.invalidate() }
+        }
+        do {
+            let result = try await withTaskCancellationHandler(operation: { try await worker.value }, onCancel: { worker.cancel() })
+            try Task.checkCancellation()
+            guard context == commentContextID else { throw CancellationError() }
+            guard Date().timeIntervalSince(started) < 25 else { throw SongCommentError.timedOut }
+            return result
+        } catch {
+            if Task.isCancelled || context != commentContextID { throw CancellationError() }
+            if Date().timeIntervalSince(started) >= 25 { throw SongCommentError.timedOut }
+            throw error
         }
     }
     func lyrics(for song: Song) async throws -> String {

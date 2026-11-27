@@ -107,6 +107,9 @@ final class SearchStore: ObservableObject {
     @Published private(set) var results: [Song] = []
     @Published private(set) var failures: [MusicPlatform: String] = [:]
     @Published private(set) var isSearching = false
+    @Published private(set) var submittedQuery = ""
+    @Published private(set) var pending: Set<MusicPlatform> = []
+    var catalogSearch: ((String, MusicPlatform) async throws -> [Song])?
     var embySearch: (@MainActor (String) async throws -> [Song])?
     var subsonicSearch: (@MainActor (String) async throws -> [Song])?
     private let catalog = CatalogClient()
@@ -116,23 +119,24 @@ final class SearchStore: ObservableObject {
     func clear() {
         task?.cancel()
         generation = UUID()
-        results = []; failures = [:]; isSearching = false
+        results = []; failures = [:]; isSearching = false; pending = []; submittedQuery = ""
     }
     func search(platforms: [MusicPlatform] = [.netease, .kugou]) {
         task?.cancel()
         generation = UUID()
         let token = generation
-        let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { results = []; failures = [:]; isSearching = false; return }
+        let text = SearchAggregationPolicy.query(query) ?? ""
+        guard !text.isEmpty, !platforms.isEmpty else { clear(); return }
+        submittedQuery = text
         isSearching = true
-        failures = [:]
+        failures = [:]; pending = Set(platforms); results = []
         task = Task { [weak self] in
             guard let self else { return }
-            var collected: [Song] = []
-            var errors: [MusicPlatform: String] = [:]
+            var buckets: [MusicPlatform: [Song]] = [:]
             await withTaskGroup(of: (MusicPlatform, [Song], String?).self) { group in
                 for platform in platforms {
-                    group.addTask { [catalog = self.catalog, embySearch = self.embySearch, subsonicSearch = self.subsonicSearch] in
+                    group.addTask { [catalog = self.catalog, catalogSearch = self.catalogSearch,
+                                     embySearch = self.embySearch, subsonicSearch = self.subsonicSearch] in
                         do {
                             if platform == .emby {
                                 guard let embySearch else { return (platform, [], "请先连接 Emby 服务器。") }
@@ -142,30 +146,34 @@ final class SearchStore: ObservableObject {
                                 guard let subsonicSearch else { return (platform, [], "请先连接 Navidrome / Subsonic 服务器。") }
                                 return (platform, try await subsonicSearch(text), nil)
                             }
-                            return (platform, try await catalog.search(text, platform: platform), nil)
+                            let songs: [Song]
+                            if let catalogSearch { songs = try await catalogSearch(text, platform) }
+                            else { songs = try await catalog.search(text, platform: platform) }
+                            return (platform, songs, nil)
                         }
                         catch is CancellationError { return (platform, [], nil) }
-                        catch { return (platform, [], "请求失败，请检查连接或重新登录后重试。") }
+                        catch { return (platform, [], "搜索失败；请检查该平台连接或稍后重试。") }
                     }
                 }
                 for await (platform, songs, error) in group {
-                    collected.append(contentsOf: songs)
-                    if let error { errors[platform] = error }
+                    guard !Task.isCancelled, self.generation == token else { group.cancelAll(); return }
+                    buckets[platform] = songs
+                    self.pending.remove(platform)
+                    if let error { self.failures[platform] = error }
+                    self.results = SearchAggregationPolicy.merged(buckets, platforms: platforms)
                 }
             }
             guard !Task.isCancelled, self.generation == token else { return }
-            var seen = Set<String>()
-            // Preserve per-platform ranking and interleave the two sources.
-            let buckets = platforms.map { p in collected.filter { $0.platform == p } }
-            var merged: [Song] = []
-            for index in 0..<(buckets.map(\.count).max() ?? 0) {
-                for bucket in buckets where index < bucket.count {
-                    if seen.insert(bucket[index].id).inserted { merged.append(bucket[index]) }
-                }
-            }
-            self.results = merged
-            self.failures = errors
-            self.isSearching = false
+            self.pending = []; self.isSearching = false; self.task = nil
         }
     }
+    #if DEBUG
+    func seedPolishFixture() {
+        task?.cancel(); generation = UUID()
+        // Filter changes submit again; keep every fixture search synthetic too.
+        catalogSearch = { _, platform in SearchPolishFixture.songs.filter { $0.platform == platform } }
+        query = "听流合成测试"; submittedQuery = query
+        results = SearchPolishFixture.songs; failures = [:]; pending = []; isSearching = false
+    }
+    #endif
 }

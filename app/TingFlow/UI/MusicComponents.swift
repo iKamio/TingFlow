@@ -46,29 +46,37 @@ struct TrackRowView: View {
     let song: Song
     let play: () -> Void
     @ObservedObject var library: LibraryStore
+    var artworkSize: CGFloat = 50
+    var showsActions: Bool = true
     var body: some View {
         HStack(spacing: 12) {
             Button(action: play) {
                 HStack(spacing: 12) {
-                    ArtworkView(url: song.displayArtworkURL, corner: 7).frame(width: 50, height: 50)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(song.title).foregroundStyle(.primary).lineLimit(1)
-                        Text("\(song.artist) · \(song.platform.title)").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    ArtworkView(url: song.displayArtworkURL, corner: 9).frame(width: artworkSize, height: artworkSize)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(song.title).foregroundStyle(.primary).font(.body.weight(.medium)).lineLimit(1)
+                        HStack(spacing: 5) {
+                            Text(song.artist.isEmpty ? "未知歌手" : song.artist).lineLimit(1)
+                            Text("·").accessibilityHidden(true)
+                            Text(song.platform.title).lineLimit(1)
+                        }.font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer(minLength: 0)
                 }.contentShape(Rectangle())
-            }.buttonStyle(.plain)
-            Menu {
-                Button(library.isFavorite(song) ? "取消本机收藏" : "仅收藏到本机", action: { library.toggleFavorite(song) })
-                ForEach(library.playlists) { playlist in
-                    Button("加入本机歌单：\(playlist.name)") { library.add(song, to: playlist.id) }
-                }
-            } label: {
-                Image(systemName: library.isFavorite(song) ? "bookmark.fill" : "ellipsis")
-                    .frame(width: 40, height: 44)
-            }.accessibilityLabel("\(song.title)的本机收藏操作")
-            if song.platform == .netease { NeteaseCloudSongMenu(store: netease, song: song) }
-        }.padding(.vertical, 3)
+            }.buttonStyle(.plain).accessibilityIdentifier("search-track-\(song.id)")
+            if showsActions {
+                Menu {
+                    Button(library.isFavorite(song) ? "取消本机收藏" : "仅收藏到本机", action: { library.toggleFavorite(song) })
+                    ForEach(library.playlists) { playlist in
+                        Button("加入本机歌单：\(playlist.name)") { library.add(song, to: playlist.id) }
+                    }
+                } label: {
+                    Image(systemName: library.isFavorite(song) ? "bookmark.fill" : "ellipsis")
+                        .frame(width: 40, height: 44)
+                }.accessibilityLabel("\(song.title)的本机收藏操作")
+                if song.platform == .netease { NeteaseCloudSongMenu(store: netease, song: song) }
+            }
+        }.padding(.vertical, 4)
     }
 }
 

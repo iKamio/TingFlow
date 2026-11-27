@@ -29,7 +29,11 @@ final class SubsonicStore: ObservableObject {
     }
 
     private var generation = UUID()
-    private var auth: Context?
+    // Opaque local epoch only; never contains account or credential material.
+    @Published private(set) var playbackContextID = UUID()
+    private var auth: Context? {
+        didSet { if oldValue !== auth { playbackContextID = UUID() } }
+    }
     private var client: SubsonicClient?
     private var restoring: SubsonicCredential?
     private var albumOffset = 0

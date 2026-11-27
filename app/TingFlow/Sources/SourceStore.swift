@@ -6,6 +6,16 @@ final class SourceStore: ObservableObject {
     @Published private(set) var sources: [UserSource] = []
     @Published private(set) var isBusy = false
     @Published private(set) var errorMessage: String?
+    @Published private(set) var attempts: [SourceAttempt] = []
+    @Published var selection: SourceSelection = .automatic {
+        didSet {
+            guard selection != oldValue else { return }
+            revision = UUID(); attempts = []
+            selectionDefaults?.set(selection.storedValue, forKey: "sourceSelection.v1")
+        }
+    }
+    private var revision = UUID()
+    private let selectionDefaults: UserDefaults?
     private let root: URL
     private let metadataURL: URL
     private let bootstrapURL: URL?
@@ -15,7 +25,9 @@ final class SourceStore: ObservableObject {
 
     init(directory: URL? = nil, bootstrapURL: URL? = nil,
          initializationTimeout: TimeInterval = 10, requestTimeout: TimeInterval = 20) {
+        selectionDefaults = directory == nil ? .standard : nil
         root = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("TingFlow/Sources", isDirectory: true)
+        selection = SourceSelection(stored: selectionDefaults?.string(forKey: "sourceSelection.v1"))
         metadataURL = root.appendingPathComponent("sources.json")
         self.bootstrapURL = bootstrapURL
         self.initializationTimeout = initializationTimeout; self.requestTimeout = requestTimeout
@@ -31,6 +43,7 @@ final class SourceStore: ObservableObject {
                 sources = saved.map(Self.durable)
             }
         } catch { errorMessage = SourceFailure.storage.localizedDescription }
+        selection = SourceSelection(stored: selectionDefaults?.string(forKey: "sourceSelection.v1"))
     }
     private static func durable(_ original: UserSource) -> UserSource {
         var value = original
@@ -38,12 +51,21 @@ final class SourceStore: ObservableObject {
         value.state = value.isTrusted ? .idle : .quarantined
         return value
     }
-    var hasEnabledSources: Bool { sources.contains { $0.isEnabled && $0.isTrusted && !SourceRuntime.isQuarantined($0.sha256) } }
+    var configurationID: UUID { revision }
+    var hasEnabledSources: Bool { !selectedSources.isEmpty }
+    var selectedSources: [UserSource] {
+        SourceSelectionPolicy.candidates(sources, selection: selection).filter { !SourceRuntime.isQuarantined($0.sha256) }
+    }
+    var selectionLabel: String {
+        switch selection {
+        case .automatic: return "自动 · 按启用顺序"
+        case .source(let id): return sources.first { $0.id == id }?.name ?? "所选音源已不可用"
+        }
+    }
     func supports(_ platform: MusicPlatform) -> Bool {
         guard platform == .netease || platform == .kugou else { return false }
-        return sources.contains {
-            $0.isEnabled && $0.isTrusted && !SourceRuntime.isQuarantined($0.sha256) &&
-            ($0.capabilities.isEmpty || $0.capabilities[platform.rawValue]?.actions.contains("musicUrl") == true)
+        return selectedSources.contains {
+            $0.capabilities.isEmpty || $0.capabilities[platform.rawValue]?.actions.contains("musicUrl") == true
         }
     }
     private func scriptURL(_ id: UUID) -> URL { root.appendingPathComponent("\(id.uuidString).js") }
@@ -67,6 +89,7 @@ final class SourceStore: ObservableObject {
     private func commit(_ next: [UserSource]) throws {
         do { try save(JSONEncoder().encode(next.map(Self.durable)), to: metadataURL) }
         catch { errorMessage = SourceFailure.storage.localizedDescription; throw SourceFailure.storage }
+        revision = UUID(); attempts = []
         sources = next; errorMessage = nil
     }
     func importScript(_ data: Data, filename: String) throws {
@@ -137,21 +160,26 @@ final class SourceStore: ObservableObject {
         guard let index = sources.firstIndex(where: { $0.id == id }) else { return }
         sources[index].state = state; sources[index].capabilities = caps
     }
-    func playback(for song: Song, quality: AudioQuality = .standard) async throws -> PlaybackResource {
+    func playback(for song: Song, quality: AudioQuality = .standard, preservingAttempts: Bool = false) async throws -> PlaybackResource {
         try Task.checkCancellation()
         guard !isBusy else { throw SourceFailure.busy }
         isBusy = true; errorMessage = nil
+        if !preservingAttempts { attempts = [] }
+        let token = revision
         defer { isBusy = false }
-        var failures: [String] = []
-        for id in sources.map(\.id) {
+        let candidates = SourceSelectionPolicy.candidates(sources, selection: selection)
+        for original in candidates {
             try Task.checkCancellation()
-            guard let original = sources.first(where: { $0.id == id }), original.isEnabled, original.isTrusted else { continue }
+            guard revision == token else { throw CancellationError() }
+            let id = original.id
             guard !SourceRuntime.isQuarantined(original.sha256) else {
-                state(id, .failed); failures.append(original.name); continue
+                state(id, .failed)
+                attempts.append(SourceAttempt(sourceID: id, name: original.name, platform: song.platform, outcome: .failed(.retired)))
+                continue
             }
             do {
                 let script = try scriptText(id)
-                try Task.checkCancellation() // Don't allocate a URLSession for an already-cancelled request.
+                try Task.checkCancellation()
                 let engine = SourceRuntime(source: original, script: script, bootstrapURL: bootstrapURL,
                                            initializationTimeout: initializationTimeout, requestTimeout: requestTimeout)
                 defer { engine.retire() }
@@ -159,26 +187,34 @@ final class SourceStore: ObservableObject {
                 try await engine.initialize()
                 try Task.checkCancellation()
                 let caps = engine.capabilities
-                guard let current = sources.first(where: { $0.id == id }), current.isEnabled, current.isTrusted,
-                      current.allowedHosts == original.allowedHosts else { throw SourceFailure.cancelled }
+                guard revision == token, let current = sources.first(where: { $0.id == id }), current.isEnabled, current.isTrusted,
+                      current.allowedHosts == original.allowedHosts else { throw CancellationError() }
                 guard let capability = caps[song.platform.rawValue], capability.actions.contains("musicUrl"),
                       let supportedQuality = capability.compatibleQuality(quality) else { throw SourceFailure.unsupported }
                 state(id, .ready, caps: caps)
                 var resource = try await engine.resolve(song: song, quality: supportedQuality)
                 resource.sourceLabel = "自定义音源 · " + original.name
                 try Task.checkCancellation()
-                guard sources.contains(where: { $0.id == id && $0.isEnabled && $0.isTrusted && $0.allowedHosts == original.allowedHosts }) else { throw SourceFailure.cancelled }
+                guard revision == token, sources.contains(where: { $0.id == id && $0.isEnabled && $0.isTrusted && $0.allowedHosts == original.allowedHosts }) else { throw CancellationError() }
+                attempts.append(SourceAttempt(sourceID: id, name: original.name, platform: song.platform, outcome: .success))
                 return resource
             } catch {
+                guard revision == token else { throw CancellationError() }
                 state(id, .failed)
-                if error is CancellationError || (error as? SourceFailure) == .cancelled || Task.isCancelled {
+                let reason = SourceSelectionPolicy.failure(error)
+                attempts.append(SourceAttempt(sourceID: id, name: original.name, platform: song.platform, outcome: .failed(reason)))
+                if error is CancellationError || reason == .cancelled || Task.isCancelled {
                     errorMessage = SourceFailure.cancelled.localizedDescription
-                    throw SourceFailure.cancelled // Cancellation never attempts another source.
+                    throw SourceFailure.cancelled
                 }
-                failures.append(original.name)
             }
         }
-        let error: MusicError = failures.isEmpty ? .noSource : .unsupported("已按启用顺序尝试音源（\(failures.joined(separator: "、"))），均未返回可用地址。卡死实例需重启后再试。")
+        let error: MusicError
+        if candidates.isEmpty {
+            error = .unsupported(selection == .automatic ? MusicError.noSource.localizedDescription : "所选音源已停用、删除或尚未授权。请重新选择，不会自动改用其他音源。")
+        } else {
+            error = .unsupported("所选音源未返回可用地址。可在播放页或音源设置查看每个源的失败原因；导入成功不等于支持此歌曲。")
+        }
         errorMessage = error.localizedDescription
         throw error
     }

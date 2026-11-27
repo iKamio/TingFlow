@@ -11,8 +11,8 @@ private final class HTTPSOnlyDelegate: NSObject, URLSessionTaskDelegate {
 
 final class CatalogClient {
     private let session: URLSession
-    init() {
-        let configuration = URLSessionConfiguration.ephemeral
+    init(configuration supplied: URLSessionConfiguration? = nil) {
+        let configuration = supplied ?? URLSessionConfiguration.ephemeral
         configuration.httpShouldSetCookies = false
         configuration.httpCookieStorage = nil
         configuration.urlCredentialStorage = nil
@@ -59,13 +59,42 @@ final class CatalogClient {
         case .netease:
             guard (root["code"] as? Int) == 200,
                   let result = root["result"] as? [String: Any] else { throw MusicError.invalidResponse }
-            return (result["songs"] as? [[String: Any]] ?? []).compactMap(parseNetease)
+            let songs = (result["songs"] as? [[String: Any]] ?? []).compactMap(parseNetease)
+            return try await enrichNeteaseArtwork(songs)
         case .kugou:
             guard (root["status"] as? Int) == 1,
                   let result = root["data"] as? [String: Any] else { throw MusicError.invalidResponse }
             return (result["lists"] as? [[String: Any]] ?? []).compactMap(parseKugou)
         case .local, .emby, .subsonic:
             return []
+        }
+    }
+
+    deinit { session.invalidateAndCancel() }
+
+    /// A single anonymous batch, with the same cancellation as the search.
+    /// Detail failure is optional: titles/order remain visible and playable.
+    private func enrichNeteaseArtwork(_ songs: [Song]) async throws -> [Song] {
+        let ids = CatalogArtworkMapping.idsNeedingArtwork(songs)
+        guard !ids.isEmpty else { return songs }
+        let url = try makeURL("https://music.163.com/api/song/detail/", ["ids": "[" + ids.joined(separator: ",") + "]"])
+        var request = URLRequest(url: url, timeoutInterval: 8)
+        request.httpShouldHandleCookies = false
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("https://music.163.com/", forHTTPHeaderField: "Referer")
+        request.setValue("Mozilla/5.0 TingFlow/0.6", forHTTPHeaderField: "User-Agent")
+        do {
+            let (data, response) = try await session.data(for: request)
+            try Task.checkCancellation()
+            guard let http = response as? HTTPURLResponse, http.url == url,
+                  (200..<300).contains(http.statusCode), data.count < 4_000_000,
+                  let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  root["code"] as? Int == 200,
+                  let details = root["songs"] as? [[String: Any]] else { return songs }
+            return CatalogArtworkMapping.merging(songs, details: details, requested: ids)
+        } catch {
+            if Task.isCancelled || error is CancellationError { throw CancellationError() }
+            return songs
         }
     }
 
@@ -89,20 +118,16 @@ final class CatalogClient {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
     private func secureArtwork(_ value: String?) -> URL? {
-        guard let value = value,
-              var components = URLComponents(string: value.replacingOccurrences(of: "{size}", with: "480")) else { return nil }
-        if components.scheme == "http" { components.scheme = "https" }
-        guard components.scheme == "https" else { return nil }
-        return components.url
+        CatalogArtworkMapping.kugouArtwork(value)
     }
     private func parseNetease(_ item: [String: Any]) -> Song? {
         guard let id = string(item["id"]), let name = item["name"] as? String else { return nil }
-        let album = item["album"] as? [String: Any] ?? [:]
-        let artists = item["artists"] as? [[String: Any]] ?? []
+        let album = item["album"] as? [String: Any] ?? item["al"] as? [String: Any] ?? [:]
+        let artists = item["artists"] as? [[String: Any]] ?? item["ar"] as? [[String: Any]] ?? []
         return Song(platform: .netease, platformID: id, title: clean(name),
                     artist: artists.compactMap { $0["name"] as? String }.joined(separator: " / "),
                     album: album["name"] as? String ?? "", duration: (item["duration"] as? Double ?? 0) / 1000,
-                    artworkURL: secureArtwork(album["picUrl"] as? String), albumID: string(album["id"]))
+                    artworkURL: CatalogArtworkMapping.artwork(album["picUrl"]), albumID: string(album["id"]))
     }
     private func parseKugou(_ item: [String: Any]) -> Song? {
         guard let hash = string(item["FileHash"]),

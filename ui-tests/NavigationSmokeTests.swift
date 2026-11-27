@@ -134,6 +134,31 @@ final class NavigationSmokeTests: XCTestCase {
         XCTAssertTrue(app.staticTexts["海风来信"].exists, "收起不清空当前曲目")
         capture("17-fixture-fullscreen-return")
     }
+    /// This verifies app re-entry only, not the OS media-card tap target.
+    @MainActor func testBackgroundReturnPreservesCurrentSongAndPlayerNavigation() throws {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments += ["-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN", "-TingFlowPolishFixture"]
+        app.launch()
+        let opener = app.buttons["展开播放器"]
+        XCTAssertTrue(opener.waitForExistence(timeout: 15))
+        XCUIDevice.shared.press(.home)
+        XCTAssertTrue(app.wait(for: .runningBackground, timeout: 8))
+        app.activate()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 8))
+        XCTAssertTrue(opener.waitForExistence(timeout: 8))
+        XCTAssertTrue(opener.isHittable)
+        opener.tap()
+        XCTAssertTrue(app.buttons["player-queue"].waitForExistence(timeout: 8))
+        XCTAssertTrue(app.staticTexts["海风来信"].exists)
+        capture("18-fixture-background-player-return")
+        XCUIDevice.shared.press(.home)
+        XCTAssertTrue(app.wait(for: .runningBackground, timeout: 8))
+        app.activate()
+        XCTAssertTrue(app.buttons["player-queue"].waitForExistence(timeout: 8))
+        XCTAssertTrue(app.buttons["收起播放器"].isHittable)
+        capture("19-fixture-background-fullscreen-preserved")
+    }
     @MainActor private func capture(_ name: String) {
         let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
         attachment.name = name

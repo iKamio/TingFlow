@@ -15,10 +15,21 @@ import Combine
     @Published var minimizeTabBar: Bool {
         didSet { UserDefaults.standard.set(minimizeTabBar, forKey: "tingflow.ui.minimize-tab-bar") }
     }
+    @Published var transitionSettings: PlaybackTransitionSettings {
+        didSet { persistTransitionSettings() }
+    }
     init() {
         quality = AudioQuality(rawValue: UserDefaults.standard.string(forKey: Self.qualityKey) ?? "") ?? .high
         playbackMode = NeteasePlaybackMode(rawValue: UserDefaults.standard.string(forKey: "tingflow.netease.playback-mode") ?? "") ?? .nativeV1
         useSources = UserDefaults.standard.object(forKey: "tingflow.playback.user-sources") as? Bool ?? true
         minimizeTabBar = UserDefaults.standard.object(forKey: "tingflow.ui.minimize-tab-bar") as? Bool ?? true
+        transitionSettings = PlaybackTransitionSettings.load()
+    }
+    private func persistTransitionSettings() {
+        let defaults = UserDefaults.standard
+        defaults.set(transitionSettings.mode.rawValue, forKey: PlaybackTransitionSettings.modeKey)
+        defaults.set(PlaybackTransitionSettings.boundedSeconds(transitionSettings.seconds), forKey: PlaybackTransitionSettings.durationKey)
+        defaults.set(transitionSettings.curve.rawValue, forKey: PlaybackTransitionSettings.curveKey)
+        NotificationCenter.default.post(name: PlaybackTransitionSettings.changed, object: nil)
     }
 }

@@ -23,20 +23,25 @@ jobs:
       - name: Prepare Xcode project
         run: |
           set -euo pipefail
+          test -d "$DEVELOPER_DIR" || { echo 'Required Xcode installation is unavailable'; exit 1; }
           xcodebuild -version
           if ! command -v xcodegen >/dev/null 2>&1; then brew install xcodegen; fi
           xcodegen --version
           xcodegen generate --spec project.yml
           python3 scripts/prepare_picker_fixture.py
       - name: Check native protocols and source runtime
-        run: bash scripts/check_native.sh
+        id: native-checks
+        run: |
+          set -euo pipefail
+          bash scripts/check_native.sh 2>&1 | tee "$RUNNER_TEMP/TingFlow-native.log"
       - name: Build unsigned native app
+        id: release-build
         run: |
           set -euo pipefail
           xcodebuild -project TingFlow.xcodeproj -scheme TingFlow -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' build \
-            | tee "$RUNNER_TEMP/TingFlow-build.log"
+            2>&1 | tee "$RUNNER_TEMP/TingFlow-build.log"
       - name: Package unsigned IPA
         id: package
         run: |
@@ -61,11 +66,40 @@ jobs:
           retention-days: 14
       - name: Native iOS simulator UI tests
         id: ui-tests
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
           set -euo pipefail
           DEVICE_ID=$(python3 scripts/select_simulator.py)
           xcodebuild -project TingFlow.xcodeproj -scheme TingFlow -configuration Debug \
             -sdk iphonesimulator -destination "platform=iOS Simulator,id=$DEVICE_ID" \
             -derivedDataPath build/simulator -resultBundlePath build/NativeUI.xcresult \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO test
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO test \
+            2>&1 | tee "$RUNNER_TEMP/TingFlow-ui.log"
+      - name: Record exact build and test outcomes
+        if: always()
+        env:
+          NATIVE_RESULT: ${{ steps.native-checks.outcome }}
+          RELEASE_RESULT: ${{ steps.release-build.outcome }}
+          UI_RESULT: ${{ steps.ui-tests.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          summary = {key: os.environ.get(key, 'unknown') for key in (
+              'GITHUB_SHA', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT',
+              'NATIVE_RESULT', 'RELEASE_RESULT', 'UI_RESULT')}
+          Path('build').mkdir(exist_ok=True)
+          Path('build/VERIFICATION_STATUS.json').write_text(json.dumps(summary, indent=2) + '\n')
+          PY
+      - name: Preserve native verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: TingFlow-verification-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            build/VERIFICATION_STATUS.json
+            ${{ runner.temp }}/TingFlow-native.log
+            ${{ runner.temp }}/TingFlow-build.log
+            ${{ runner.temp }}/TingFlow-ui.log
+          if-no-files-found: error
+          retention-days: 14

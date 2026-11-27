@@ -1,0 +1,82 @@
+[
+  {
+    "name": "qr-web",
+    "parameters": {
+      "dfid": "-",
+      "mid": "123456789012345678",
+      "uuid": "-",
+      "appid": "1014",
+      "clientver": "20489",
+      "clienttime": "1700000000",
+      "type": "1",
+      "plat": "4",
+      "srcappid": "2919",
+      "qrcode_txt": "https://h5.kugou.com/apps/loginQRCode/html/index.html?appid=1005&"
+    },
+    "body": "",
+    "kind": "web",
+    "signature": "2e657543e6dd367291a450664472dbbe"
+  },
+  {
+    "name": "qr-check-web",
+    "parameters": {
+      "dfid": "-",
+      "mid": "123456789012345678",
+      "uuid": "-",
+      "appid": "1005",
+      "clientver": "20489",
+      "clienttime": "1700000000",
+      "plat": "4",
+      "srcappid": "2919",
+      "qrcode": "synthetic-key",
+      "dev": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    },
+    "body": "",
+    "kind": "web",
+    "signature": "022071c03961093ae645f1a96ca04ddf"
+  },
+  {
+    "name": "playlists-android",
+    "parameters": {
+      "dfid": "-",
+      "mid": "123456789012345678",
+      "uuid": "-",
+      "appid": "1005",
+      "clientver": "20489",
+      "clienttime": "1700000000",
+      "userid": "42",
+      "token": "synthetic-token",
+      "plat": "1"
+    },
+    "body": "{\"userid\":42,\"token\":\"synthetic-token\",\"total_ver\":979,\"type\":2,\"page\":1,\"pagesize\":100}",
+    "kind": "android",
+    "signature": "9e8eab26f8632adc3879b6f98560aac6"
+  },
+  {
+    "name": "tracks-android",
+    "parameters": {
+      "dfid": "-",
+      "mid": "123456789012345678",
+      "uuid": "-",
+      "appid": "1005",
+      "clientver": "20489",
+      "clienttime": "1700000000",
+      "userid": "42",
+      "token": "synthetic-token"
+    },
+    "body": "{\"listid\":9,\"userid\":42,\"type\":0,\"page\":1,\"pagesize\":100,\"area_code\":1,\"allplatform\":1,\"show_cover\":1,\"token\":\"synthetic-token\"}",
+    "kind": "android",
+    "signature": "3a852d39043a5369452882af471595b7"
+  },
+  {
+    "name": "web-full-fields",
+    "parameters": {
+      "a": "z",
+      "aa": "a",
+      "a-": "&+=中文"
+    },
+    "body": "",
+    "kind": "web",
+    "signature": "5c84d7985bab647ad9c19f8bd87138f5"
+  }
+]

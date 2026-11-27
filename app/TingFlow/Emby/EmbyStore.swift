@@ -36,7 +36,11 @@ final class EmbyStore: ObservableObject {
     private var refreshID = UUID()
     private var searchID = UUID()
     private var client: EmbyClient?
-    private var auth: Context?
+    // Opaque local epoch only; never contains account or credential material.
+    @Published private(set) var playbackContextID = UUID()
+    private var auth: Context? {
+        didSet { if oldValue !== auth { playbackContextID = UUID() } }
+    }
     private var restoring: Credential?
     private let device: String
     private let cache: URL

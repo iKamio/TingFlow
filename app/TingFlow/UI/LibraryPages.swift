@@ -2,6 +2,8 @@ import SwiftUI
 
 struct BrowseView: View {
     @EnvironmentObject private var subsonic: SubsonicStore
+    @EnvironmentObject private var kugou: KugouStore
+    @ObservedObject var library: LibraryStore
     @Environment(\.dynamicTypeSize) private var typeSize
     @ObservedObject var emby: EmbyStore
     @ObservedObject var netease: NeteaseStore
@@ -46,11 +48,15 @@ struct BrowseView: View {
                         }
                     }
                 }
-                VStack(alignment: .leading, spacing: 8) {
-                    Label("酷狗已接入搜索", systemImage: "magnifyingglass").font(.headline)
-                    Text("酷狗可通过你信任并启用的洛雪 JS 解析播放；账号登录仍待接入。")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }
+                NavigationLink {
+                    KugouPlaylistsView(store: kugou, library: library, onPlay: { songs, index in
+                        guard let scope = kugou.accountScope,
+                              songs.allSatisfy({ $0.accountScope == scope }) else { return }
+                        player.play(songs, at: index)
+                    })
+                } label: {
+                    ConnectionCard(title: "酷狗音乐", subtitle: kugou.isSignedIn ? kugou.accountName : "扫码连接 · 云端歌单只读", symbol: "music.note.list")
+                }.buttonStyle(.plain).accessibilityIdentifier("browse-kugou-playlists")
             }.padding(20)
         }.navigationTitle("浏览").background(Color(uiColor: .systemBackground))
     }
@@ -67,6 +73,7 @@ struct BrowseView: View {
 
 struct MusicLibraryView: View {
     @EnvironmentObject private var subsonic: SubsonicStore
+    @EnvironmentObject private var kugou: KugouStore
     @ObservedObject var library: LibraryStore
     @ObservedObject var emby: EmbyStore
     @ObservedObject var netease: NeteaseStore
@@ -91,6 +98,14 @@ struct MusicLibraryView: View {
                 NavigationLink {
                     NeteaseHistoryView(store: netease, onPlay: { player.play($0, at: $1) })
                 } label: { libraryLabel("网易云最近播放", symbol: "clock.arrow.circlepath") }
+                NavigationLink {
+                    KugouPlaylistsView(store: kugou, library: library, onPlay: { songs, index in
+                        guard let scope = kugou.accountScope,
+                              songs.allSatisfy({ $0.accountScope == scope }) else { return }
+                        player.play(songs, at: index)
+                    })
+                } label: { libraryLabel("酷狗云歌单 · 只读", symbol: "music.note.list") }
+                .accessibilityIdentifier("library-kugou-playlists")
             }
             Section("我的收藏") {
                 NavigationLink { playlistPage } label: { libraryLabel("播放列表", symbol: "music.note.list") }
@@ -133,6 +148,7 @@ struct MusicLibraryView: View {
 
 struct AccountSettingsView: View {
     @EnvironmentObject private var subsonic: SubsonicStore
+    @EnvironmentObject private var kugou: KugouStore
     @ObservedObject var emby: EmbyStore
     @ObservedObject var netease: NeteaseStore
     @ObservedObject var sources: SourceStore
@@ -140,6 +156,9 @@ struct AccountSettingsView: View {
     var body: some View {
         List {
             Section("音乐账号") {
+                NavigationLink { KugouAccountView(store: kugou) } label: {
+                    Label(kugou.isSignedIn ? kugou.accountName : "连接酷狗音乐 · 扫码只读", systemImage: "person.crop.circle")
+                }.accessibilityIdentifier("settings-kugou-account")
                 NavigationLink { NeteaseAccountView(store: netease) } label: {
                     Label(netease.isSignedIn ? "网易云 · \(netease.accountName)" : "连接网易云音乐", systemImage: "person.crop.circle")
                 }
@@ -164,17 +183,23 @@ struct AccountSettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("自定义音源") {
+                Text("当前播放解析选择：\(sources.selectionLabel)。平台账号与音源权限相互独立；脚本仍需审阅并授权精确域名。")
+                    .font(.footnote).foregroundStyle(.secondary)
+                NavigationLink { SourceSelectionView(store: sources) } label: {
+                    Label("选择自动或单一播放音源", systemImage: "arrow.trianglehead.2.clockwise.rotate.90")
+                }
                 NavigationLink { SourceManagerView(store: sources) } label: {
                     Label("管理洛雪 JS 音源 · \(sources.sources.count)", systemImage: "doc.badge.gearshape")
                 }
-                Text(sources.hasEnabledSources ? "音源由你授权；播放失败时按启用顺序尝试。" : "尚无启用音源。只支持经审查的 LX mobile 2.0 子集，不共享平台 Cookie。")
-                    .font(.footnote).foregroundStyle(.secondary)
             }
             Section("播放体验") {
                 NavigationLink { PlaybackSettingsView(preferences: preferences) } label: { Label("音质与界面", systemImage: "waveform") }
+                NavigationLink { SourceSelectionView(store: sources) } label: {
+                    Label("播放解析音源 · \(sources.selectionLabel)", systemImage: "arrow.trianglehead.2.clockwise.rotate.90")
+                }
             }
             Section("关于") {
-                Text("听流 · 0.5.1")
+                Text("听流 · \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—")")
                 NavigationLink { UpdateView() } label: { Label("检查更新", systemImage: "arrow.down.circle") }
                 Text("iOS 26 使用系统 TabView、搜索 Tab 与底部播放器附件。网易云为非官方兼容接口，存在失效风险；Emby 仅访问你填写的服务器。构建通过不代表真机登录或播放已验证。")
                     .font(.footnote).foregroundStyle(.secondary)
@@ -183,53 +208,108 @@ struct AccountSettingsView: View {
     }
 }
 
+private struct SearchPlatformFilter: Identifiable {
+    let title: String
+    let platform: MusicPlatform?
+    var id: String { title }
+}
+
 struct UnifiedSearchView: View {
     @EnvironmentObject private var subsonic: SubsonicStore
     @ObservedObject var search: SearchStore
     @ObservedObject var library: LibraryStore
     @ObservedObject var emby: EmbyStore
     @ObservedObject var player: PlayerStore
+    @ObservedObject var sources: SourceStore
     @State private var source = "全部"
-    private let options = ["全部", "网易云", "酷狗", "Emby", "音乐服"]
+    private var filters: [SearchPlatformFilter] {
+        [SearchPlatformFilter(title: "全部", platform: nil), SearchPlatformFilter(title: "网易云", platform: .netease),
+         SearchPlatformFilter(title: "酷狗", platform: .kugou)] +
+        (emby.isSignedIn ? [SearchPlatformFilter(title: "Emby", platform: .emby)] : []) +
+        (subsonic.isSignedIn ? [SearchPlatformFilter(title: "音乐服", platform: .subsonic)] : [])
+    }
+    private var platforms: [MusicPlatform] { filters.compactMap { $0.platform } }
+    private var selectedPlatform: MusicPlatform? { filters.first(where: { $0.title == source })?.platform }
+    private var matchesSubmittedQuery: Bool { SearchAggregationPolicy.matches(search.query, submitted: search.submittedQuery) }
+    private var visibleResults: [Song] {
+        guard matchesSubmittedQuery else { return [] }
+        guard let platform = selectedPlatform else { return search.results }
+        return search.results.filter { $0.platform == platform }
+    }
     var body: some View {
         List {
             Section {
-                Picker("来源", selection: $source) { ForEach(options, id: \.self) { Text($0) } }
-                    .pickerStyle(.segmented).padding(.vertical, 5)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(filters) { filter in
+                            Button { source = filter.title } label: {
+                                Text(filter.title).font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(source == filter.title ? Color.white : Color.primary)
+                                    .padding(.horizontal, 15).padding(.vertical, 9).frame(minHeight: 44)
+                                    .background(source == filter.title ? Color.pink : Color(uiColor: .secondarySystemGroupedBackground), in: Capsule())
+                            }.buttonStyle(.plain).accessibilityIdentifier("search-filter-\(filter.title)")
+                                .accessibilityAddTraits(source == filter.title ? .isSelected : [])
+                        }
+                    }
+                }
+                .listRowInsets(EdgeInsets(top: 7, leading: 16, bottom: 7, trailing: 16))
+                HStack {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("搜索结果").font(.headline)
+                        Text("按平台聚合 · 点一首即可播放").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    NavigationLink {
+                        SourceSelectionView(store: sources) { if let song = player.current { player.play(player.queue, at: player.index) } }
+                    } label: {
+                        VStack(alignment: .trailing, spacing: 3) {
+                            Text("播放音源").font(.caption2).foregroundStyle(.secondary)
+                            Text(sources.selectionLabel).font(.caption.weight(.semibold)).lineLimit(1)
+                        }.foregroundStyle(.primary)
+                    }.accessibilityIdentifier("search-parser-selection")
+                }
+                .listRowSeparator(.hidden)
             }
-            if search.isSearching { ProgressView("正在搜索…") }
-            ForEach([MusicPlatform.netease, .kugou, .emby, .subsonic]) { platform in
-                if let error = search.failures[platform] {
+            if search.isSearching {
+                HStack(spacing: 10) { ProgressView(); Text("正在搜索已连接的平台…").font(.footnote).foregroundStyle(.secondary) }
+                    .accessibilityIdentifier("search-loading")
+            }
+            ForEach(platforms, id: \.self) { platform in
+                if (selectedPlatform == nil || selectedPlatform == platform), let error = search.failures[platform] {
                     Text("\(platform.title)：\(error)").font(.footnote).foregroundStyle(.secondary)
+                        .accessibilityIdentifier("search-error-\(platform.rawValue)")
                 }
             }
-            if !search.isSearching, !search.query.isEmpty, (source == "全部" || source == "Emby"), let notice = emby.searchNotice {
-                Text(notice).font(.footnote).foregroundStyle(.secondary)
-            }
-            if search.results.isEmpty && !search.isSearching {
-                Text(source == "Emby" && !emby.isSignedIn ? "请先在账号设置连接 Emby 服务器。" : "搜索歌曲、歌手或专辑关键词")
-                    .foregroundStyle(.secondary)
-            }
-            ForEach(Array(search.results.enumerated()), id: \.offset) { index, song in
-                TrackRowView(song: song, play: { player.play(search.results, at: index) }, library: library)
+            if !search.query.isEmpty && !matchesSubmittedQuery && !search.isSearching {
+                Text("输入完成后按搜索键；结果会按已连接平台聚合。")
+                    .font(.footnote).foregroundStyle(.secondary)
+            } else if visibleResults.isEmpty && !search.isSearching {
+                Text(search.submittedQuery.isEmpty ? "搜索歌曲、歌手或专辑" : "没有找到匹配结果。尝试切换平台或检查连接。")
+                    .foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                ForEach(Array(visibleResults.enumerated()), id: \.element.id) { index, song in
+                    TrackRowView(song: song, play: { player.play(visibleResults, at: index) }, library: library,
+                                 artworkSize: 58, showsActions: false)
+                        .listRowInsets(EdgeInsets(top: 7, leading: 16, bottom: 7, trailing: 16))
+                        .accessibilityIdentifier("search-row-\(song.platform.rawValue)-\(song.platformID)")
+                }
             }
         }
         .listStyle(.plain).navigationTitle("搜索")
         .searchable(text: $search.query, prompt: "音乐、歌手或专辑")
         .onSubmit(of: .search, run)
         .onChange(of: source) { _ in if !search.query.isEmpty { run() } }
-        .onChange(of: search.query) { if $0.isEmpty { search.clear() } }
-    }
-    private func run() {
-        let platforms: [MusicPlatform]
-        switch source {
-        case "网易云": platforms = [.netease]
-        case "酷狗": platforms = [.kugou]
-        case "Emby": platforms = [.emby]
-        case "音乐服": platforms = [.subsonic]
-        default:
-            platforms = [.netease, .kugou] + (emby.isSignedIn ? [.emby] : []) + (subsonic.isSignedIn ? [.subsonic] : [])
+        .onChange(of: search.query) { value in
+            if value.isEmpty { search.clear() }
+            else if !SearchAggregationPolicy.matches(value, submitted: search.submittedQuery) { search.clear() }
         }
-        search.search(platforms: platforms)
+        .onChange(of: emby.isSignedIn) { _ in normalizeFilter() }
+        .onChange(of: subsonic.isSignedIn) { _ in normalizeFilter() }
+        .task { normalizeFilter() }
+    }
+    private func normalizeFilter() { if !filters.contains(where: { $0.title == source }) { source = "全部" } }
+    private func run() {
+        let selected = filters.first(where: { $0.title == source })?.platform.map { [$0] } ?? platforms
+        search.search(platforms: selected)
     }
 }

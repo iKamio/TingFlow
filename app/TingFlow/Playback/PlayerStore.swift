@@ -17,8 +17,14 @@ final class PlayerStore: ObservableObject {
     @Published private(set) var isPreview = false
     @Published private(set) var artworkImage: UIImage?
     @Published private(set) var sourceLabel = ""
-    @Published var shuffle = false { didSet { rebuildOrder() } }
-    @Published var repeatMode: RepeatMode = .sequential
+    @Published var shuffle = false {
+        didSet {
+            if shuffle != oldValue { transitionResolutionContextDidChange(); rebuildOrder() }
+        }
+    }
+    @Published var repeatMode: RepeatMode = .sequential {
+        didSet { if repeatMode != oldValue { transitionResolutionContextDidChange() } }
+    }
     var resolver: ((Song) async throws -> PlaybackResource)?
     var onStarted: ((Song) -> Void)?
     var onListeningStarted: ((ListeningSession) -> Void)?
@@ -32,7 +38,9 @@ final class PlayerStore: ObservableObject {
     private var listeningSession: ListeningSession?
     private var listeningCycleID = UUID()
 
-    private let player = AVPlayer()
+    private let anchorPlayer = AVPlayer()
+    /// While an incoming deck is promoted it becomes the active AVPlayer; otherwise playback stays on anchorPlayer.
+    private var player: AVPlayer { activeDeck?.player ?? anchorPlayer }
     private var generation = UUID()
     private var resolving: Task<Void, Never>?
     private var artworkTask: Task<Void, Never>?
@@ -49,18 +57,44 @@ final class PlayerStore: ObservableObject {
     private var reportedStart = false
     private var ended = false
     private var interruptionResume: UUID?
+    private var activeDeck: PlaybackTransitionDeck?
+    private var pendingDeck: PlaybackTransitionDeck?
+    private var pendingSong: Song?
+    private var pendingTicket: PlaybackTransitionTicket?
+    private var pendingPlan: BeatTransitionPlan?
+    private var pendingIncomingOffset = 0.0
+    private var pendingPrepared = false
+    private var preparationDeadlineTask: Task<Void, Never>?
+    private let anchorOnsetCapture = PlaybackOnsetCapture()
+    private var activeOnsetCapture: PlaybackOnsetCapture { activeDeck?.onsetCapture ?? anchorOnsetCapture }
+    private var transitionStarting = false
+    private var transitionStartDeadline = 0.0
+    private var transitionCancelledForCurrentItem = false
+    private var fading = false
+    private var fadeStart = 0.0
+    private var fadeDuration = 0.0
+    private var fadeTimer: Timer?
+    private var preloadingTask: Task<Void, Never>?
+    private var resolvingTicket: PlaybackTransitionTicket?
+    private var transitionSettings = PlaybackTransitionSettings.load()
+    private var transitionSettingsObserver: NSObjectProtocol?
+    private var queueRevision = UUID()
+    private var transitionAttempts = PlaybackTransitionAttemptGate()
+    private var currentResource: PlaybackResource?
+    private var monitoredPlayer: AVPlayer?
+    @Published private(set) var transitionStatus = ""
 
     init() {
-        observations = [
-            player.observe(\.timeControlStatus, options: [.new]) { [weak self] _, _ in
-                Task { @MainActor [weak self] in self?.refresh() }
-            },
-            player.observe(\.rate, options: [.new]) { [weak self] _, _ in
-                Task { @MainActor [weak self] in self?.refresh() }
+        observeActivePlayer()
+        transitionSettingsObserver = NotificationCenter.default.addObserver(
+            forName: PlaybackTransitionSettings.changed, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.transitionSettings = PlaybackTransitionSettings.load()
+                self.cancelTransition(reason: self.transitionSettings.mode == .off ? "曲目过渡已关闭" : "播放设置已更改，改用普通切歌")
+                self.transitionAttempts.reset()
             }
-        ]
-        clock = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.refresh() }
         }
         for name in [AVAudioSession.interruptionNotification, AVAudioSession.routeChangeNotification] {
             notifications.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
@@ -72,8 +106,30 @@ final class PlayerStore: ObservableObject {
         }
         installCommands(); publishMetadata()
     }
+    private func observeActivePlayer() {
+        clearActivePlayerObservation()
+        let observedPlayer = player
+        monitoredPlayer = observedPlayer
+        observations = [
+            observedPlayer.observe(\.timeControlStatus, options: [.new]) { [weak self] _, _ in
+                Task { @MainActor [weak self] in self?.refresh() }
+            },
+            observedPlayer.observe(\.rate, options: [.new]) { [weak self] _, _ in
+                Task { @MainActor [weak self] in self?.refresh() }
+            }
+        ]
+        clock = observedPlayer.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refresh() }
+        }
+    }
+    private func clearActivePlayerObservation() {
+        observations.forEach { $0.invalidate() }; observations.removeAll()
+        if let clock, let monitoredPlayer { monitoredPlayer.removeTimeObserver(clock) }
+        clock = nil; monitoredPlayer = nil
+    }
     func play(_ songs: [Song], at: Int) {
         guard !songs.isEmpty else { stop(); return }
+        queueRevision = UUID(); cancelTransition(reason: "播放队列已更改"); transitionAttempts.reset()
         queue = songs; index = min(max(at, 0), songs.count - 1)
         rebuildOrder(); select(index)
     }
@@ -81,6 +137,7 @@ final class PlayerStore: ObservableObject {
         if wantsPlay || isPlaying { pause() } else { resume() }
     }
     func pause() {
+        cancelTransition(reason: "已暂停 · 继续时正常切歌")
         interruptionResume = nil; wantsPlay = false; player.pause(); refresh()
     }
     func next() { advance(1) }
@@ -89,6 +146,7 @@ final class PlayerStore: ObservableObject {
     }
     func seek(to value: Double) {
         guard value.isFinite, duration > 0, player.currentItem?.status == .readyToPlay else { return }
+        cancelTransition(reason: "定位后正常切歌")
         let time = min(max(value, 0), duration), token = generation
         ended = false
         listeningSession?.seek()
@@ -101,13 +159,28 @@ final class PlayerStore: ObservableObject {
             }
         }
     }
+    /// Call when source configuration, source selection, quality, platform mode, or source-use policy changes.
+    /// Cancels a credential/settings-bound speculative resolve without interrupting the playing item.
+    func transitionResolutionContextDidChange() {
+        queueRevision = UUID()
+        cancelTransition(reason: "音源或播放设置已更改 · 普通切歌")
+        transitionAttempts.reset()
+    }
     func stop() {
         retire(); artwork = nil; artworkImage = nil; sourceLabel = ""; current = nil; queue = []; index = -1; order = []
         elapsed = 0; duration = 0; errorMessage = nil; qualityLabel = "原始音频"; isPreview = false
         publishMetadata()
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
-    private func rebuildOrder() { order = PlaybackPolicy.order(ids: queue.map(\.id), start: index, shuffle: shuffle) }
+    private func rebuildOrder() {
+        let rebuilt = PlaybackPolicy.order(ids: queue.map(\.id), start: index, shuffle: shuffle)
+        if rebuilt != order {
+            queueRevision = UUID()
+            cancelTransition(reason: "播放顺序已更改 · 普通切歌")
+            transitionAttempts.reset()
+        }
+        order = rebuilt
+    }
     private func advance(_ step: Int) {
         guard let position = order.firstIndex(of: index), !order.isEmpty else { return }
         var next = position + step
@@ -119,7 +192,10 @@ final class PlayerStore: ObservableObject {
     }
     private func select(_ index: Int) {
         guard queue.indices.contains(index) else { return }
-        retire(); artwork = nil; artworkImage = nil; sourceLabel = ""; self.index = index; current = queue[index]; elapsed = 0
+        retire(); transitionAttempts.reset(); currentResource = nil
+        transitionCancelledForCurrentItem = false
+        transitionStatus = transitionSettings.mode == .off ? "曲目过渡已关闭" : "等待下一首过渡"
+        artwork = nil; artworkImage = nil; sourceLabel = ""; self.index = index; current = queue[index]; elapsed = 0
         duration = PlaybackPolicy.finite(queue[index].duration); qualityLabel = "原始音频"; isPreview = false
         errorMessage = nil; reportedStart = false; ended = false; wantsPlay = true; isLoading = true
         let song = queue[index], token = generation
@@ -185,10 +261,13 @@ final class PlayerStore: ObservableObject {
             loader = bridge; asset = bridge.makeAsset()
         } else { asset = AVURLAsset(url: resource.url) }
         let item = AVPlayerItem(asset: asset)
+        item.preferredForwardBufferDuration = 5
+        currentResource = resource
         qualityLabel = PlaybackPolicy.metadata(resource.displayQuality); isPreview = resource.isPreview; sourceLabel = PlaybackPolicy.metadata(resource.sourceLabel ?? "")
         listeningScope = song.platform == .netease && !resource.isPreview ? resource.neteaseHistoryScope : nil
         listeningCycleID = UUID(); listeningSession = nil
         player.replaceCurrentItem(with: item)
+        anchorOnsetCapture.start(on: item, enabled: transitionSettings.mode == .beat && !resource.isPreview)
         itemObservation = item.observe(\.status, options: [.initial, .new]) { [weak self, weak item] _, _ in
             Task { @MainActor [weak self, weak item] in
                 guard let self, let item, self.generation == token, self.player.currentItem === item else { return }
@@ -206,6 +285,311 @@ final class PlayerStore: ObservableObject {
         if wantsPlay { try activate(); player.play() }
         refresh()
     }
+    private func scheduleTransitionPreloadIfNeeded() {
+        guard transitionSettings.mode != .off, wantsPlay, !ended, current != nil,
+              !transitionCancelledForCurrentItem,
+              transitionSettings == PlaybackTransitionSettings.load(),
+              currentResource != nil, pendingTicket == nil, pendingDeck == nil,
+              preloadingTask == nil, resolvingTicket == nil,
+              let resolve = resolver else { return }
+        if repeatMode == .one { transitionStatus = "单曲循环 · 不做曲目过渡"; return }
+        guard let mediaDuration = player.currentItem?.duration.seconds,
+              PlaybackTransitionMath.eligible(duration: mediaDuration, fade: transitionSettings.seconds) else {
+            transitionStatus = "正常切歌 · 时长未知或曲目过短"; return
+        }
+        guard let next = PlaybackTransitionMath.nextIndex(
+            order: order, current: index, wraps: repeatMode == .all, repeatsOne: repeatMode == .one
+        ), queue.indices.contains(next) else { return }
+        let position = player.currentTime().seconds
+        let remaining = mediaDuration - position
+        let fade = PlaybackTransitionMath.boundedFade(transitionSettings.seconds)
+        guard position.isFinite, remaining.isFinite, remaining > 0,
+              remaining <= max(8, fade + 7), transitionAttempts.claim(next) else { return }
+        let song = queue[next]
+        let ticket = PlaybackTransitionTicket(generation: generation, queueRevision: queueRevision,
+                                              targetIndex: next, songID: song.id)
+        pendingTicket = ticket; resolvingTicket = ticket; pendingSong = song; pendingPrepared = false
+        pendingPlan = nil; pendingIncomingOffset = 0; transitionStarting = false; fading = false
+        transitionStatus = transitionSettings.mode == .beat ? "准备有限起音采样 · 不保证鼓点同步…" : "预加载下一首以准备淡化…"
+        preloadingTask = Task { [weak self] in
+            // Do not retain the store while a non-cooperative resolver is suspended.
+            do {
+                let resource = try await resolve(song)
+                try Task.checkCancellation()
+                guard let self, self.transitionTicketIsCurrent(ticket) else { return }
+                await self.prepareTransition(ticket, song: song, resource: resource)
+            } catch {
+                guard let self, self.pendingTicket == ticket else { return }
+                self.cancelTransition(reason: "正常切歌 · 下一首预加载不可用")
+            }
+        }
+    }
+    private func prepareTransition(_ ticket: PlaybackTransitionTicket, song: Song,
+                                   resource: PlaybackResource) async {
+        var candidate: PlaybackTransitionDeck?
+        defer {
+            if resolvingTicket == ticket { resolvingTicket = nil; preloadingTask = nil }
+        }
+        do {
+            try Task.checkCancellation()
+            guard transitionTicketIsCurrent(ticket) else { return }
+            let deck = PlaybackTransitionDeck(); candidate = deck
+            deck.onEvent = { [weak self] deck, event in self?.transitionDeck(deck, received: event) }
+            try deck.attach(resource, song: song)
+            guard transitionTicketIsCurrent(ticket) else { deck.dispose(); return }
+            pendingDeck = deck
+            let position = player.currentTime().seconds
+            let mediaDuration = player.currentItem?.duration.seconds ?? .nan
+            let nominalStart = mediaDuration - PlaybackTransitionMath.boundedFade(transitionSettings.seconds)
+            guard position.isFinite, nominalStart.isFinite, nominalStart - position > 1 else {
+                cancelTransition(reason: "正常切歌 · 准备时间不足"); return
+            }
+            let deadline = ProcessInfo.processInfo.systemUptime + min(6, nominalStart - position - 0.15)
+            preparationDeadlineTask?.cancel()
+            preparationDeadlineTask = Task { [weak self] in
+                let delay = max(0, deadline - ProcessInfo.processInfo.systemUptime)
+                do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) } catch { return }
+                guard let self, self.pendingTicket == ticket, !self.pendingPrepared else { return }
+                self.cancelTransition(reason: "正常切歌 · 准备超时")
+            }
+            let beatEnabled = transitionSettings.mode == .beat && !resource.isPreview && currentResource?.isPreview == false
+            guard let incomingItem = deck.player.currentItem else { throw PlaybackFailure.source }
+            deck.onsetCapture.start(on: incomingItem, enabled: beatEnabled)
+            // Readiness is required; unsupported/slow tap installation must not delay fixed fade.
+            while !deck.isReady {
+                try Task.checkCancellation()
+                guard transitionTicketIsCurrent(ticket), pendingDeck === deck,
+                      ProcessInfo.processInfo.systemUptime < deadline - PlaybackTransitionPreparationPolicy.restoreBudget else {
+                    throw PlaybackFailure.source
+                }
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            let installationDeadline = min(deadline - PlaybackTransitionPreparationPolicy.restoreBudget,
+                ProcessInfo.processInfo.systemUptime + 0.5)
+            while beatEnabled && deck.onsetCapture.installing && ProcessInfo.processInfo.systemUptime < installationDeadline {
+                try await Task.sleep(nanoseconds: 20_000_000)
+                guard transitionTicketIsCurrent(ticket), pendingDeck === deck else { deck.dispose(); return }
+            }
+            if deck.onsetCapture.installing { deck.onsetCapture.stop() }
+            var plan: BeatTransitionPlan?
+            var status = "固定淡化 · 已准备"
+            if beatEnabled, let outgoing = currentResource {
+                if outgoing.url.isFileURL && resource.url.isFileURL && outgoing.headers.isEmpty && resource.headers.isEmpty
+                    && !outgoing.requiresResourceLoader && !resource.requiresResourceLoader {
+                    let result = await BeatTransitionAnalyzer.analyze(outgoing: outgoing, incoming: resource,
+                        duration: mediaDuration, fade: transitionSettings.seconds)
+                    plan = result.plan; status = result.message
+                } else {
+                    let budget = min(PlaybackTransitionPreparationPolicy.probeBudget(
+                        position: player.currentTime().seconds, duration: mediaDuration, fade: transitionSettings.seconds),
+                        max(0, deadline - ProcessInfo.processInfo.systemUptime - PlaybackTransitionPreparationPolicy.restoreBudget))
+                    let incoming = await deck.probeHead(budget: budget)
+                    try Task.checkCancellation()
+                    guard transitionTicketIsCurrent(ticket), pendingDeck === deck else { deck.dispose(); return }
+                    let outgoingEvidence = activeOnsetCapture.tap?.snapshot() ?? []
+                    plan = BeatOnsetAnalysis.plan(outgoing: outgoingEvidence, incoming: incoming,
+                        duration: mediaDuration, requestedFade: transitionSettings.seconds)
+                    status = plan == nil ? "固定淡化 · 流媒体起音证据不足" : "机会式起音对齐 · 非持续节拍同步"
+                }
+            }
+            try Task.checkCancellation()
+            guard transitionTicketIsCurrent(ticket), pendingDeck === deck else { deck.dispose(); return }
+            if let proposed = plan, !PlaybackTransitionPreparationPolicy.acceptsPlan(proposed, position: player.currentTime().seconds) {
+                plan = nil; status = "固定淡化 · 起音计划已错过"
+            }
+            pendingPlan = plan
+            pendingIncomingOffset = plan?.incomingStart ?? 0
+            // A probe may have moved the item even without usable evidence. Always confirm exact restore.
+            let sought = await deck.seek(to: pendingIncomingOffset,
+                deadline: min(deadline, ProcessInfo.processInfo.systemUptime + PlaybackTransitionPreparationPolicy.restoreBudget))
+            try Task.checkCancellation()
+            guard transitionTicketIsCurrent(ticket), pendingDeck === deck else { deck.dispose(); return }
+            guard sought else { cancelTransition(reason: "正常切歌 · 起音回位失败或超时"); return }
+            if let proposed = pendingPlan, proposed.outgoingStart <= player.currentTime().seconds {
+                // Never backdate a plan or call a partially restored offset fixed-from-zero.
+                pendingPlan = nil; pendingIncomingOffset = 0
+                let restored = await deck.seek(to: 0,
+                    deadline: min(deadline, ProcessInfo.processInfo.systemUptime + PlaybackTransitionPreparationPolicy.restoreBudget))
+                try Task.checkCancellation()
+                guard transitionTicketIsCurrent(ticket), pendingDeck === deck else { deck.dispose(); return }
+                guard restored else { cancelTransition(reason: "正常切歌 · 回零失败"); return }
+                status = "固定淡化 · 起音计划已错过"
+            }
+            guard PlaybackTransitionPreparationPolicy.canPrepare(
+                current: transitionTicketIsCurrent(ticket) && pendingDeck === deck, restored: sought,
+                ready: deck.isReady, position: player.currentTime().seconds, nominalStart: nominalStart,
+                now: ProcessInfo.processInfo.systemUptime, deadline: deadline) else {
+                cancelTransition(reason: "正常切歌 · 已错过准备窗口"); return
+            }
+            preparationDeadlineTask?.cancel(); preparationDeadlineTask = nil
+            pendingPrepared = true
+            transitionStatus = status
+            candidate = nil
+            startFadeTimer(ticket)
+            updateTransition()
+        } catch {
+            candidate?.dispose()
+            guard pendingTicket == ticket else { return }
+            cancelTransition(reason: "正常切歌 · 下一首预加载不可用")
+        }
+    }
+    private func transitionTicketIsCurrent(_ ticket: PlaybackTransitionTicket) -> Bool {
+        guard let pendingTicket, pendingTicket == ticket else { return false }
+        return ticket.generation == generation && ticket.queueRevision == queueRevision &&
+            queue.indices.contains(ticket.targetIndex) && queue[ticket.targetIndex].id == ticket.songID &&
+            PlaybackTransitionMath.nextIndex(order: order, current: index, wraps: repeatMode == .all,
+                                            repeatsOne: repeatMode == .one) == ticket.targetIndex &&
+            wantsPlay && !transitionCancelledForCurrentItem && transitionSettings.mode != .off &&
+            transitionSettings == PlaybackTransitionSettings.load()
+    }
+    private func transitionDeck(_ deck: PlaybackTransitionDeck, received event: PlaybackTransitionDeck.Event) {
+        if deck === pendingDeck {
+            switch event {
+            case .changed: updateTransition()
+            case .ended: cancelTransition(reason: "正常切歌 · 预加载音频已结束")
+            case .failed:
+                cancelTransition(reason: "正常切歌 · 预加载音频不可用")
+            }
+        } else if deck === activeDeck {
+            switch event {
+            case .changed: refresh()
+            case .ended: didEnd()
+            case .failed(let error): fail(error)
+            }
+        }
+    }
+    private func cancelTransition(reason: String) {
+        // Invalidate identities before disposing: cancellation can enqueue callbacks.
+        // A pause/seek/settings change conservatively disables overlap for this item.
+        transitionCancelledForCurrentItem = true; transitionStartDeadline = 0
+        preparationDeadlineTask?.cancel(); preparationDeadlineTask = nil
+        activeOnsetCapture.stop()
+        preloadingTask?.cancel(); preloadingTask = nil; resolvingTicket = nil
+        let cancelledDeck = pendingDeck
+        pendingDeck = nil; pendingSong = nil; pendingTicket = nil; pendingPlan = nil
+        pendingIncomingOffset = 0; pendingPrepared = false
+        transitionStarting = false; fading = false; fadeStart = 0; fadeDuration = 0
+        stopFadeTimer()
+        cancelledDeck?.dispose()
+        player.volume = 1
+        transitionStatus = reason
+    }
+    private func updateTransition() {
+        guard let ticket = pendingTicket else { stopFadeTimer(); return }
+        guard transitionTicketIsCurrent(ticket) else {
+            cancelTransition(reason: "正常切歌 · 过渡状态已失效"); return
+        }
+        guard pendingPrepared, let incoming = pendingDeck else { return }
+        guard !incoming.hasEnded else { cancelTransition(reason: "正常切歌 · 下一首已结束"); return }
+        guard incoming.isReady else { return }
+        let requestedFade = pendingPlan?.fadeSeconds ?? PlaybackTransitionMath.boundedFade(transitionSettings.seconds)
+        guard let incomingDuration = incoming.finiteDuration,
+              PlaybackTransitionMath.eligible(duration: incomingDuration, fade: requestedFade) else {
+            cancelTransition(reason: "正常切歌 · 下一首时长未知或过短"); return
+        }
+        let now = player.currentTime().seconds
+        let mediaDuration = player.currentItem?.duration.seconds ?? .nan
+        guard now.isFinite, mediaDuration.isFinite, mediaDuration > 0 else {
+            cancelTransition(reason: "正常切歌 · 播放时钟不可用"); return
+        }
+        if now >= mediaDuration {
+            guard pendingPlan == nil || fading else {
+                cancelTransition(reason: "正常切歌 · 自然结束已错过起音计划"); return
+            }
+            incoming.player.play()
+            promoteIncoming(ticket, naturalEnd: true)
+            return
+        }
+        // Do not let one deck run away while the other stalls.
+        if fading && (!incoming.isActuallyPlaying || player.timeControlStatus != .playing) {
+            cancelTransition(reason: "正常切歌 · 缓冲中断淡化"); return
+        }
+        let nominalStart = pendingPlan?.outgoingStart ?? mediaDuration - PlaybackTransitionMath.boundedFade(transitionSettings.seconds)
+        guard nominalStart.isFinite else { return }
+        if !fading, pendingPlan != nil,
+           PlaybackTransitionPreparationPolicy.missedPlan(start: nominalStart, position: now) {
+            cancelTransition(reason: "正常切歌 · 已错过起音计划，不回填"); return
+        }
+        if !transitionStarting && !fading && now >= nominalStart {
+            guard player.timeControlStatus == .playing else { return }
+            do { try activate() }
+            catch { cancelTransition(reason: "正常切歌 · 无法启动第二播放器"); return }
+            incoming.player.volume = 0
+            transitionStarting = true
+            transitionStartDeadline = ProcessInfo.processInfo.systemUptime + 2
+            startFadeTimer(ticket)
+            transitionStatus = "等待下一首开始 · 尚未淡化"
+            incoming.player.play()
+        }
+        if transitionStarting && incoming.isActuallyPlaying {
+            transitionStarting = false; fading = true
+            fadeStart = now
+            fadeDuration = min(requestedFade, max(0.08, mediaDuration - fadeStart))
+            transitionStatus = pendingPlan == nil ? "固定交叉淡化中" : "机会式起音衔接 · 非节拍同步"
+        } else if transitionStarting && ProcessInfo.processInfo.systemUptime >= transitionStartDeadline {
+            cancelTransition(reason: "正常切歌 · 下一首启动超时"); return
+        }
+        guard fading, let progress = PlaybackTransitionMath.progress(position: now, start: fadeStart, duration: fadeDuration) else { return }
+        let gains = PlaybackTransitionMath.gains(progress: progress, curve: transitionSettings.curve)
+        player.volume = gains.outgoing; incoming.player.volume = gains.incoming
+        if progress >= 1 { promoteIncoming(ticket) }
+    }
+    private func startFadeTimer(_ ticket: PlaybackTransitionTicket) {
+        stopFadeTimer()
+        let timer = Timer(timeInterval: 0.04, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.pendingTicket == ticket else { return }
+                self.updateTransition()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common); fadeTimer = timer
+    }
+    private func promoteIncoming(_ ticket: PlaybackTransitionTicket, naturalEnd: Bool = false) {
+        guard transitionTicketIsCurrent(ticket), let incoming = pendingDeck,
+              incoming.isReady, !incoming.hasEnded,
+              let song = pendingSong, let resource = incoming.resource else {
+            cancelTransition(reason: "正常切歌 · 过渡状态已失效"); return
+        }
+        let oldDeck = activeDeck
+        let outgoingPlayer = player
+        clearActivePlayerObservation()
+        itemObservation?.invalidate(); itemObservation = nil
+        itemNotifications.forEach { NotificationCenter.default.removeObserver($0) }; itemNotifications.removeAll()
+        // Retire the outgoing identity before pause/replacement can enqueue events.
+        generation = UUID()
+        activeOnsetCapture.stop()
+        incoming.onsetCapture.resetWindow()
+        preparationDeadlineTask?.cancel(); preparationDeadlineTask = nil
+        outgoingPlayer.pause(); outgoingPlayer.volume = 1; outgoingPlayer.cancelPendingPrerolls()
+        outgoingPlayer.currentItem?.cancelPendingSeeks(); outgoingPlayer.replaceCurrentItem(with: nil)
+        loader?.invalidate(); loader = nil
+        finishListening(naturalEnd: naturalEnd)
+        listeningScope = nil
+        preloadingTask?.cancel(); preloadingTask = nil; resolvingTicket = nil
+        pendingDeck = nil; pendingTicket = nil; pendingSong = nil; pendingPlan = nil
+        pendingIncomingOffset = 0; pendingPrepared = false
+        transitionStarting = false; fading = false; transitionStartDeadline = 0
+        fadeStart = 0; fadeDuration = 0; stopFadeTimer()
+        activeDeck = incoming; incoming.player.volume = 1
+        oldDeck?.dispose()
+        currentResource = resource
+        index = ticket.targetIndex; current = song
+        elapsed = PlaybackPolicy.finite(incoming.player.currentTime().seconds)
+        duration = incoming.finiteDuration ?? PlaybackPolicy.finite(song.duration)
+        qualityLabel = PlaybackPolicy.metadata(resource.displayQuality)
+        sourceLabel = PlaybackPolicy.metadata(resource.sourceLabel ?? "")
+        isPreview = resource.isPreview; errorMessage = nil
+        reportedStart = false; ended = false; wantsPlay = true
+        listeningScope = song.platform == .netease && !resource.isPreview ? resource.neteaseHistoryScope : nil
+        listeningCycleID = UUID(); listeningSession = nil
+        artworkTask?.cancel(); artworkTask = nil; artwork = nil; artworkImage = nil
+        transitionAttempts.reset(); transitionCancelledForCurrentItem = false; transitionStatus = ""
+        loadArtwork(for: song, token: generation)
+        observeActivePlayer(); publishMetadata(); refresh()
+    }
+    private func stopFadeTimer() {
+        fadeTimer?.invalidate(); fadeTimer = nil
+    }
     private func activate() throws {
         let audio = AVAudioSession.sharedInstance()
         try audio.setCategory(.playback, mode: .default)
@@ -220,6 +604,25 @@ final class PlayerStore: ObservableObject {
         catch { fail(.network) }
     }
     private func didEnd() {
+        guard !ended else { return }
+        // Natural end may beat the final timer tick. Reuse only a ready, finite,
+        // non-ended deck with a still-current queue/settings ticket.
+        if let ticket = pendingTicket, let incoming = pendingDeck,
+           (pendingPlan == nil || fading), transitionTicketIsCurrent(ticket),
+           PlaybackTransitionMath.shouldPromoteAtEnd(
+               wantsPlay: wantsPlay, incomingPrepared: pendingPrepared, repeatsOne: repeatMode == .one,
+               incomingReady: incoming.isReady,
+               incomingEligible: incoming.finiteDuration.map {
+                   PlaybackTransitionMath.eligible(duration: $0, fade: transitionSettings.seconds)
+               } ?? false, incomingEnded: incoming.hasEnded
+           ) {
+            incoming.player.volume = 1
+            incoming.player.play()
+            promoteIncoming(ticket, naturalEnd: true)
+            return
+        }
+        // A late/failed preparation cannot outlive normal repeat/queue advancement.
+        cancelTransition(reason: "正常切歌 · 过渡未及时就绪")
         finishListening(naturalEnd: true)
         listeningCycleID = UUID()
         ended = true
@@ -236,10 +639,17 @@ final class PlayerStore: ObservableObject {
             elapsed = min(PlaybackPolicy.finite(player.currentTime().seconds), duration > 0 ? duration : .greatestFiniteMagnitude)
         }
         isPlaying = wantsPlay && player.timeControlStatus == .playing && player.rate > 0
+        if transitionSettings.mode == .beat, !transitionCancelledForCurrentItem,
+           let seconds = player.currentItem?.duration.seconds {
+            activeOnsetCapture.armTail(duration: seconds, fade: transitionSettings.seconds)
+        }
         sampleListening()
         isLoading = wantsPlay && (resolving != nil || player.timeControlStatus == .waitingToPlayAtSpecifiedRate)
         publishMetadata()
         if isPlaying, !reportedStart, let song = current { reportedStart = true; onStarted?(song) }
+        guard wantsPlay else { return }
+        updateTransition()
+        scheduleTransitionPreloadIfNeeded()
     }
     private func sampleListening() {
         guard reportsListening, let song = current, let scope = listeningScope, !ended else { return }
@@ -260,18 +670,24 @@ final class PlayerStore: ObservableObject {
         listeningScope = nil
         generation = UUID(); resolving?.cancel(); resolving = nil
         artworkTask?.cancel(); artworkTask = nil
-        // Preserve an accepted current cover on audio failure; select/stop clear it explicitly.
         interruptionResume = nil; wantsPlay = false; isPlaying = false; isLoading = false
+        cancelTransition(reason: "普通切歌")
         itemObservation?.invalidate(); itemObservation = nil
         itemNotifications.forEach { NotificationCenter.default.removeObserver($0) }; itemNotifications = []
-        player.pause(); player.replaceCurrentItem(with: nil)
-        loader?.invalidate(); loader = nil
+        clearActivePlayerObservation()
+        let outgoing = player
+        outgoing.pause(); outgoing.volume = 1; outgoing.currentItem?.cancelPendingSeeks()
+        outgoing.replaceCurrentItem(with: nil)
+        loader?.invalidate(); loader = nil; currentResource = nil
+        let oldDeck = activeDeck; activeDeck = nil; oldDeck?.dispose()
+        observeActivePlayer()
     }
     private func fail(_ error: PlaybackFailure) {
         retire(); errorMessage = error.localizedDescription; publishMetadata()
     }
     private func audioEvent(type: UInt?, options: UInt, route: UInt?) {
         if type == AVAudioSession.InterruptionType.began.rawValue {
+            cancelTransition(reason: "音频中断 · 恢复后正常切歌")
             interruptionResume = wantsPlay ? generation : nil
             wantsPlay = false; player.pause(); refresh()
         } else if type == AVAudioSession.InterruptionType.ended.rawValue {
@@ -322,12 +738,26 @@ final class PlayerStore: ObservableObject {
         commands.append((command, target))
     }
     deinit {
-        resolving?.cancel(); artworkTask?.cancel(); itemObservation?.invalidate(); observations.forEach { $0.invalidate() }
-        if let clock { player.removeTimeObserver(clock) }
+        resolving?.cancel(); artworkTask?.cancel(); preloadingTask?.cancel()
+        preparationDeadlineTask?.cancel()
+        // Nonisolated destructor: capture owned resources, never capture the dying store.
+        // Normal retire/cancel paths detach synchronously; this is final-release fallback only.
+        let finalAnchorCapture = anchorOnsetCapture
+        let finalPendingDeck = pendingDeck, finalActiveDeck = activeDeck
+        let finalAnchorPlayer = anchorPlayer
+        Task { @MainActor in
+            finalAnchorCapture.stop()
+            finalPendingDeck?.dispose(); finalActiveDeck?.dispose()
+            finalAnchorPlayer.pause()
+        }
+        itemObservation?.invalidate(); observations.forEach { $0.invalidate() }
+        if let clock, let monitoredPlayer { monitoredPlayer.removeTimeObserver(clock) }
+        fadeTimer?.invalidate()
+        if let transitionSettingsObserver { NotificationCenter.default.removeObserver(transitionSettingsObserver) }
         itemNotifications.forEach { NotificationCenter.default.removeObserver($0) }
         notifications.forEach { NotificationCenter.default.removeObserver($0) }
         commands.forEach { $0.0.removeTarget($0.1) }
-        player.pause(); loader?.invalidate()
+        anchorPlayer.pause(); loader?.invalidate()
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }

@@ -19,6 +19,7 @@ private final class NeteaseRedirectBlocker: NSObject, URLSessionTaskDelegate {
         case playlist = "/api/v6/playlist/detail"
         case songs = "/api/v3/song/detail"
         case lyric = "/api/song/lyric"
+        case comments = "/api/v2/resource/comments"
         case playback = "/api/song/enhance/player/url"
         case playbackV1 = "/api/song/enhance/player/url/v1"
         case dailySongs = "/api/v3/discovery/recommend/songs"
@@ -172,10 +173,12 @@ private final class NeteaseRedirectBlocker: NSObject, URLSessionTaskDelegate {
                 if http.statusCode == 429 { throw NeteaseError.rateLimited }
                 throw NeteaseError.http(http.statusCode)
             }
-            guard response.expectedContentLength <= 25_000_000 else { throw NeteaseError.response }
+            let responseLimit = endpoint == .comments ? 2_000_000 : 25_000_000
+            guard response.expectedContentLength <= responseLimit else { throw NeteaseError.response }
             var data = Data(); data.reserveCapacity(64_000)
             for try await byte in bytes {
-                guard data.count < 25_000_000 else { throw NeteaseError.response }
+                guard data.count < responseLimit else { throw NeteaseError.response }
+                if endpoint == .comments && data.count % 4096 == 0 { try Task.checkCancellation() }
                 data.append(byte)
             }
             try Task.checkCancellation()
@@ -187,7 +190,8 @@ private final class NeteaseRedirectBlocker: NSObject, URLSessionTaskDelegate {
                 diagnostic?.mediaCodes = Array((object["data"] as? [[String: Any]] ?? []).prefix(8).compactMap { $0["code"] as? Int })
             }
             try NeteaseWire.validate(code: code, endpoint: endpoint)
-            absorbResponseCookies(http, url: url)
+            // A read-only comment response must not mutate/persist account or anonymous cookies.
+            if endpoint != .comments { absorbResponseCookies(http, url: url) }
             return object
         } catch is CancellationError { throw CancellationError() }
         catch let error as NeteaseError { throw error }
