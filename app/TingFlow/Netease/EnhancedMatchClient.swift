@@ -8,8 +8,8 @@ enum EnhancedMatchSource: String, Codable, CaseIterable, Identifiable {
 
 struct EnhancedMatchConfiguration: Codable, Equatable {
     var enabled = false
-    var address = ""
-    var source = EnhancedMatchSource.automatic
+    var address = "https://api-enhanced-psi-khaki.vercel.app"
+    var source = EnhancedMatchSource.msls
 
     func baseURL() throws -> URL {
         let value = address.trimmingCharacters(in: .whitespacesAndNewlines)
